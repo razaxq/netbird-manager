@@ -614,8 +614,9 @@ svc_file_path() {
 }
 
 svc_stop() {
+    local f; f=$(svc_file_path)
     case "$INIT_SYS" in
-        procd)   [ -f "$(svc_file_path)" ] && "$(svc_file_path)" stop 2>/dev/null || true ;;
+        procd)   if [ -x "$f" ]; then "$f" stop 2>/dev/null || true; fi ;;
         systemd) systemctl stop "$NB_SERVICE_NAME" 2>/dev/null || true ;;
         openrc)  rc-service "$NB_SERVICE_NAME" stop 2>/dev/null || true ;;
     esac

@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # Pinned rather than apt's build: the distro version lags, and a version bump that adds a new
+  # check would otherwise turn CI red on a commit that changed nothing. Bump deliberately.
+  SHELLCHECK_VERSION: v0.11.0
+
 jobs:
   lint:
     name: Lint and unit tests
@@ -13,8 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install shells and shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck dash busybox
+      - name: Install target shells
+        run: sudo apt-get update -qq && sudo apt-get install -y dash busybox
+
+      - name: Install shellcheck
+        run: |
+          set -eu
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL "$url" -o /tmp/shellcheck.tar.xz
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
 
       - name: ShellCheck (POSIX sh dialect)
         run: shellcheck -s sh netbird.sh tests/*.sh
