@@ -1,0 +1,43 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shells and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck dash busybox
+
+      - name: ShellCheck (POSIX sh dialect)
+        run: shellcheck -s sh netbird.sh tests/*.sh
+
+      - name: Parse under every target shell
+        run: |
+          set -eu
+          for interp in "sh" "dash" "busybox sh"; do
+            echo "--- $interp -n"
+            $interp -n netbird.sh
+            $interp -n tests/test_manager.sh
+          done
+
+      - name: Unit tests under every target shell
+        run: |
+          set -eu
+          for interp in "sh" "dash" "busybox sh"; do
+            echo "=== $interp tests/test_manager.sh"
+            $interp tests/test_manager.sh
+          done
+
+      - name: Subcommands that must work without root
+        run: |
+          set -eu
+          sh netbird.sh help    > /dev/null
+          sh netbird.sh version > /dev/null

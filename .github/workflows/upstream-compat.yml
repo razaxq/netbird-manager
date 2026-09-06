@@ -1,0 +1,49 @@
+name: Upstream compatibility
+
+# NetBird's release layout is an external contract this script depends on: asset names, the
+# per-asset sha256 digest, and a top-level `netbird` binary inside the tarball. Check it on a
+# schedule so a breaking change upstream shows up here rather than on someone's router.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"   # Mondays, 04:17 UTC
+  workflow_dispatch:
+  push:
+    paths:
+      - netbird.sh
+      - tests/test_upstream_compat.sh
+      - .github/workflows/upstream-compat.yml
+
+jobs:
+  compat:
+    name: Release layout still matches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the live release matrix, digests and archive layout
+        env:
+          NB_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # lifts the anonymous 60/h API limit
+        run: sh tests/test_upstream_compat.sh
+
+      - name: Install the real binary into a throwaway prefix
+        env:
+          NB_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          prefix=$(mktemp -d)
+          NB_SOURCE_ONLY=1 \
+          NB_BIN_DIR="$prefix/usr/bin" NB_ETC_DIR="$prefix/etc/netbird" \
+          NB_INITD_DIR="$prefix/etc/init.d" NB_SYSTEMD_DIR="$prefix/etc/systemd/system" \
+          LOG_FILE="$prefix/manager.log" NB_NONINTERACTIVE=1 \
+          sh -c '
+            . ./netbird.sh
+            detect_system
+            select_version
+            do_download
+            do_install_bin
+            write_daemon_args
+            svc_write
+            "$NB_BIN" version
+            cat "$(svc_file_path)"
+          '
