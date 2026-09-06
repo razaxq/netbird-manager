@@ -82,7 +82,7 @@
 #      log target are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 # ── Tunables ──────────────────────────────────────────
 # Sentinels record whether the user set the var explicitly; after detect_system, procd applies
@@ -91,6 +91,8 @@ _u_backup=${NB_BACKUP_KEEP:+1}
 _u_logfile=${NB_LOG_FILE:+1}
 _u_resolver=${NB_DNS_RESOLVER_ADDRESS:+1}
 _u_logpath=${LOG_FILE:+1}
+_u_iface=${NB_INTERFACE_NAME:+1}
+_u_mgmt=${NB_MANAGEMENT_URL:+1}
 
 NB_REPO="netbirdio/netbird"
 NB_BACKUP_KEEP="${NB_BACKUP_KEEP:-3}"            # backups kept for the binary
@@ -565,10 +567,13 @@ _bool_value() { case "$1" in 1|true|yes|on|y|Y) return 0 ;; *) return 1 ;; esac;
 # systemd needs literal % doubled in ExecStart
 _systemd_escape_args() { printf '%s' "$1" | sed 's/%/%%/g'; }
 
+# -P is what keeps this parseable: without it GNU df wraps a long device name onto its own line
+# and the "Available" column lands on line 3, not line 2. BusyBox df accepts -P too.
 _avail_mb() {
     local dir="$1" out
     [ -d "$dir" ] || dir=$(dirname "$dir")
-    out=$(df -k "$dir" 2>/dev/null | awk 'NR==2 {print int($4/1024)}')
+    out=$(df -Pk "$dir" 2>/dev/null | awk 'NR > 1 { print int($4 / 1024); exit }')
+    [ -n "$out" ] || out=$(df -k "$dir" 2>/dev/null | awk 'NR > 1 { print int($4 / 1024); exit }')
     [ -n "$out" ] && printf '%s' "$out" || printf '0'
 }
 _check_space() {
@@ -585,19 +590,45 @@ _warn_ctrl_input() {
 }
 
 # Prompt for a line of text.  $1 prompt  $2 default
+#
+# The prompt goes to STDERR, not stdout. Every caller reads the answer with
+# `ans=$(_read_text …)`, and a command substitution captures stdout — so a prompt printed there
+# would be invisible to the user AND glued onto the front of the returned value, turning a menu
+# choice of "3" into "Choice: 3". Only the answer may reach stdout.
 _read_text() {
     local prompt="$1" def="${2:-}" ans=''
-    if [ -n "$def" ]; then printf '%s' "$prompt [$def]: "; else printf '%s' "$prompt: "; fi
+    if [ -n "$def" ]; then printf '%s' "$prompt [$def]: " >&2; else printf '%s' "$prompt: " >&2; fi
     IFS= read -r ans || ans=''
     [ -z "$ans" ] && ans="$def"
     printf '%s' "$ans"
 }
 
+# Prompt for a secret, with terminal echo off so it is not left on screen or in a scrollback
+# buffer. The script goes out of its way to keep the setup key off disk and out of argv; echoing
+# it into the terminal would undo much of that. Falls back to a visible read where stty cannot
+# touch the terminal, with a warning, rather than silently reading nothing.
+_read_secret() {
+    local prompt="$1" ans='' saved=''
+    printf '%s' "$prompt: " >&2
+    if saved=$(stty -g 2>/dev/null); then
+        stty -echo 2>/dev/null
+        IFS= read -r ans || ans=''
+        stty "$saved" 2>/dev/null
+        printf '\n' >&2
+    else
+        printf '(input will be visible) ' >&2
+        IFS= read -r ans || ans=''
+    fi
+    printf '%s' "$ans"
+}
+
 # Yes/no prompt.  $1 question  $2 default (y|n)
+# Answer is the exit status, so stdout is free — but the prompt still goes to stderr, to keep
+# every prompt in this script on one stream and safe to call from a command substitution.
 _ask_flag() {
     local q="$1" def="${2:-n}" ans=''
     [ "${NB_NONINTERACTIVE:-0}" = "1" ] && { [ "$def" = y ]; return $?; }
-    if [ "$def" = y ]; then printf '%s' "$q [Y/n]: "; else printf '%s' "$q [y/N]: "; fi
+    if [ "$def" = y ]; then printf '%s' "$q [Y/n]: " >&2; else printf '%s' "$q [y/N]: " >&2; fi
     IFS= read -r ans || ans=''
     [ -z "$ans" ] && ans="$def"
     case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
@@ -1083,6 +1114,36 @@ do_install_bin() {
 }
 
 # ==============================================================================
+#  Saved settings
+# ==============================================================================
+# Re-read what a previous run configured. Without this, every menu action taken in a *later* run
+# — set up the firewall, add the DNS forwarding, revert on uninstall — would operate on this
+# run's defaults (wt0, cloud, no resolver) instead of on what is actually deployed: the firewall
+# zone would bind the wrong interface and the dnsmasq entry would forward the wrong domain.
+# Values given explicitly through the environment still win.
+load_saved_args() {
+    [ -r "$NB_UP_ARGS_FILE" ] || return 0
+    local key='' line=''
+    while IFS= read -r line; do
+        case "$line" in
+            --*) key="$line"; continue ;;   # a bool flag is simply replaced by the next key
+        esac
+        [ -n "$key" ] || continue
+        case "$key" in
+            --management-url)
+                [ -n "$_u_mgmt" ]     || NB_MANAGEMENT_URL="$line" ;;
+            --interface-name)
+                [ -n "$_u_iface" ]    || NB_INTERFACE_NAME="$line" ;;
+            --dns-resolver-address)
+                [ -n "$_u_resolver" ] || NB_DNS_RESOLVER_ADDRESS="$line" ;;
+        esac
+        key=''
+    done < "$NB_UP_ARGS_FILE"
+    _log "INFO" "loaded saved args: iface=${NB_INTERFACE_NAME} resolver=${NB_DNS_RESOLVER_ADDRESS:-none}"
+    return 0
+}
+
+# ==============================================================================
 #  `netbird up` argument wizard
 # ==============================================================================
 _derive_dns_domain() {
@@ -1125,7 +1186,7 @@ _up_wizard() {
             3) NB_AUTH="none" ;;
             *) NB_AUTH="key"
                if [ -z "$NB_SETUP_KEY" ] && [ -z "$NB_SETUP_KEY_FILE" ]; then
-                   NB_SETUP_KEY=$(_read_text "$(t "Setup key" "Setup Key")" "")
+                   NB_SETUP_KEY=$(_read_secret "$(t "Setup key" "Setup Key")")
                fi ;;
         esac
 
@@ -1295,29 +1356,46 @@ do_disconnect() {
 # ==============================================================================
 #  OpenWrt integration — DNS forwarding, firewall zone, network interface
 # ==============================================================================
+# These scan `uci show` rather than walking indices with `uci get`. Walking stops at the first
+# section that happens to lack the option being probed — a single unnamed zone would hide every
+# zone after it — whereas the dump lists them all.
 _uci_zone_index() {
-    local i=0 n
-    while n=$(uci -q get "firewall.@zone[$i].name" 2>/dev/null); do
-        [ "$n" = "netbird" ] && { printf '%s' "$i"; return 0; }
-        i=$((i + 1))
+    local idx
+    idx=$(uci -q show firewall 2>/dev/null \
+          | sed -n "s/^firewall\.@zone\[\([0-9][0-9]*\)\]\.name='netbird'\$/\1/p" | head -1)
+    [ -n "$idx" ] || return 1
+    printf '%s' "$idx"
+}
+
+_uci_forwarding_exists() {
+    local src="$1" dst="$2" i
+    for i in $(uci -q show firewall 2>/dev/null \
+               | sed -n "s/^firewall\.@forwarding\[\([0-9][0-9]*\)\]\.src='${src}'\$/\1/p"); do
+        [ "$(uci -q get "firewall.@forwarding[$i].dest" 2>/dev/null)" = "$dst" ] && return 0
     done
     return 1
 }
 
-_uci_forwarding_exists() {
-    local src="$1" dst="$2" i=0 s d
-    while s=$(uci -q get "firewall.@forwarding[$i].src" 2>/dev/null); do
-        d=$(uci -q get "firewall.@forwarding[$i].dest" 2>/dev/null)
-        [ "$s" = "$src" ] && [ "$d" = "$dst" ] && return 0
-        i=$((i + 1))
-    done
-    return 1
+# First forwarding index that mentions the netbird zone on either side (for revert).
+_uci_forwarding_netbird_index() {
+    local idx
+    idx=$(uci -q show firewall 2>/dev/null \
+          | sed -n "s/^firewall\.@forwarding\[\([0-9][0-9]*\)\]\.\(src\|dest\)='netbird'\$/\1/p" | head -1)
+    [ -n "$idx" ] || return 1
+    printf '%s' "$idx"
 }
 
 openwrt_dns_setup() {
     command -v uci > /dev/null 2>&1 || { msg_err "$(t "uci not found" "未找到 uci")"; return 1; }
-    [ -n "$NB_DNS_RESOLVER_ADDRESS" ] || {
-        msg_warn "$(t "No DNS resolver address configured; skipping" "未配置 DNS 解析器地址，跳过")"; return 0; }
+    # Forwarding only works against a pinned port. With no --dns-resolver-address the client
+    # picks a free port by itself and any entry written here would point at the wrong one.
+    if [ -z "$NB_DNS_RESOLVER_ADDRESS" ]; then
+        msg_warn "$(t "NetBird's resolver address is not pinned, so a forwarding entry would go stale." \
+                      "NetBird 解析器地址未固定，写入的转发条目会失效。")"
+        msg_info "$(t "Run \"Configure and connect\" first, or set NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5053." \
+                      "请先执行\"配置并连接\"，或设置 NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5053。")"
+        return 1
+    fi
 
     local domain addr port entry
     domain=$(_derive_dns_domain)
@@ -1394,23 +1472,24 @@ openwrt_firewall_setup() {
 
 openwrt_revert() {
     command -v uci > /dev/null 2>&1 || return 0
-    local i domain
+    local i domain e
     domain=$(_derive_dns_domain)
     uci -q delete network.netbird 2>/dev/null && uci commit network
     while i=$(_uci_zone_index); do
         uci -q delete "firewall.@zone[$i]" 2>/dev/null || break
     done
-    i=0
-    while uci -q get "firewall.@forwarding[$i].src" > /dev/null 2>&1; do
-        if [ "$(uci -q get "firewall.@forwarding[$i].src")" = "netbird" ] || \
-           [ "$(uci -q get "firewall.@forwarding[$i].dest")" = "netbird" ]; then
-            uci -q delete "firewall.@forwarding[$i]"
-            continue
-        fi
-        i=$((i + 1))
+    # deleting a section renumbers the ones after it, so always re-find the first match
+    while i=$(_uci_forwarding_netbird_index); do
+        uci -q delete "firewall.@forwarding[$i]" 2>/dev/null || break
     done
     uci commit firewall 2>/dev/null || true
-    uci -q del_list "dhcp.@dnsmasq[0].server=/${domain}/${NB_DNS_RESOLVER_ADDRESS%:*}#${NB_DNS_RESOLVER_ADDRESS##*:}" 2>/dev/null
+    # Match the entry by domain, not by rebuilding the string from NB_DNS_RESOLVER_ADDRESS: on an
+    # uninstall run that variable may be empty or hold a different port than the one installed.
+    for e in $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null); do
+        case "$e" in
+            "/${domain}/"*) uci -q del_list "dhcp.@dnsmasq[0].server=${e}" 2>/dev/null ;;
+        esac
+    done
     uci commit dhcp 2>/dev/null || true
     /etc/init.d/firewall restart > /dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
@@ -1671,6 +1750,21 @@ show_help() {
     printf '\n'
 }
 
+# `curl … | sh` leaves stdin pointing at the script's own source, so every prompt would read a
+# line of shell code instead of an answer and the run would proceed on garbage. Refuse instead,
+# and say how to do it properly. NB_NONINTERACTIVE asks no questions, so it is exempt.
+_require_interactive() {
+    [ "${NB_NONINTERACTIVE:-0}" = "1" ] && return 0
+    [ -t 0 ] && return 0
+    msg_err "$(t "This action asks questions, but stdin is not a terminal." \
+                 "该操作需要交互，但标准输入不是终端。")"
+    msg_info "$(t "Piping the script into a shell makes every prompt read the script itself." \
+                  "把脚本通过管道喂给 shell，会让每个提示读到脚本自身的内容。")"
+    _cmd_hint "curl -fsSL <url> -o netbird.sh && sh netbird.sh" "$(t "download first, then run" "先下载再运行")"
+    _cmd_hint "NB_NONINTERACTIVE=1 NB_SETUP_KEY=… sh netbird.sh" "$(t "or drive it with variables" "或用变量驱动")"
+    exit 2
+}
+
 show_version() {
     printf '%s\n' "netbird-manager ${SCRIPT_VERSION}"
     if [ -x "$NB_BIN" ]; then
@@ -1682,6 +1776,7 @@ show_version() {
 
 main() {
     detect_system || true
+    load_saved_args
 
     # procd tightening: routers have little flash and a tmpfs /var, so keep one backup and let
     # procd own the log stream instead of writing a rotating file into RAM.
@@ -1701,6 +1796,10 @@ main() {
                  "本脚本需要 root 权限运行（可用: sudo sh netbird.sh）")"
 
     _log "INFO" "start v${SCRIPT_VERSION} arg=${1:-menu}"
+
+    case "${1:-}" in
+        ''|install|update|uninstall) _require_interactive ;;
+    esac
 
     case "${1:-}" in
         install)   do_install ;;

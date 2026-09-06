@@ -141,6 +141,26 @@ assert_eq "digest of the decoy asset" \
     "$(_digest_of netbird-idp-migrate_0.78.1_linux_arm64.tar.gz)"
 assert_eq "unknown asset yields nothing" "" "$(_digest_of netbird_9.9.9_linux_arm64.tar.gz)"
 
+printf '\n== prompts ==\n'
+# Regression: _read_text is always called as ans=$(_read_text …), so a prompt written to stdout
+# is both invisible to the user and glued onto the answer — every menu choice then falls through
+# to "Unknown choice". Only the answer may reach stdout; the prompt belongs on stderr.
+assert_eq "answer only, prompt not captured"  "3" "$(printf '3\n'  | _read_text "Choice" "" 2>/dev/null)"
+assert_eq "empty input falls back to default" "7" "$(printf '\n'   | _read_text "Choice" "7" 2>/dev/null)"
+assert_eq "answer wins over the default"      "2" "$(printf '2\n'  | _read_text "Choice" "7" 2>/dev/null)"
+assert_eq "answer keeps inner spaces"    "a b c" "$(printf 'a b c\n' | _read_text "Name" "" 2>/dev/null)"
+if [ -n "$(printf '3\n' | _read_text "Choice" "" 2>&1 >/dev/null)" ]; then
+    ok "the prompt is still shown, on stderr"
+else
+    bad "the prompt is still shown, on stderr"
+fi
+assert_eq "secret answer is returned" "k3y" "$(printf 'k3y\n' | _read_secret "Setup key" 2>/dev/null)"
+
+# _ask_flag answers through its exit status, so its prompt must not pollute stdout either
+assert_true  "yes is accepted"     sh -c "printf 'y\n' | { . '${SCRIPT_DIR}/netbird.sh'; _ask_flag Q n; }" 2>/dev/null
+assert_false "no is accepted"      sh -c "printf 'n\n' | { . '${SCRIPT_DIR}/netbird.sh'; _ask_flag Q y; }" 2>/dev/null
+assert_true  "empty takes default" sh -c "printf '\n'  | { . '${SCRIPT_DIR}/netbird.sh'; _ask_flag Q y; }" 2>/dev/null
+
 printf '\n== generated files ==\n'
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -218,6 +238,64 @@ assert_eq "up.args is owner-readable only" "600" "$(stat -c '%a' "$NB_UP_ARGS_FI
 NB_MTU="42"
 assert_false "an out-of-range MTU is rejected" write_up_args
 NB_MTU=""
+
+printf '\n== saved settings are reloaded on a later run ==\n'
+# A second run of the script must act on what is deployed, not on this run's defaults: otherwise
+# the firewall zone binds wt0 while the client uses nb0, and the DNS entry forwards the wrong
+# domain. Bool flags in up.args have no value line, so the parser must not mistake the following
+# flag for one.
+cat > "$NB_UP_ARGS_FILE" <<'ARGS'
+--management-url
+https://nb.example.com:443
+--disable-server-routes
+--interface-name
+nb0
+--block-inbound
+--dns-resolver-address
+127.0.0.1:5353
+ARGS
+NB_MANAGEMENT_URL=""; NB_INTERFACE_NAME="wt0"; NB_DNS_RESOLVER_ADDRESS=""
+_u_mgmt=""; _u_iface=""; _u_resolver=""
+load_saved_args
+assert_eq "management URL restored"  "https://nb.example.com:443" "$NB_MANAGEMENT_URL"
+assert_eq "interface name restored"  "nb0"                        "$NB_INTERFACE_NAME"
+assert_eq "resolver address restored" "127.0.0.1:5353"            "$NB_DNS_RESOLVER_ADDRESS"
+assert_eq "self-hosted DNS domain derived" "netbird.selfhosted"   "$(_derive_dns_domain)"
+
+# an explicit environment value must survive the reload
+NB_INTERFACE_NAME="from-env"; _u_iface=1
+load_saved_args
+assert_eq "explicit env value wins over the saved one" "from-env" "$NB_INTERFACE_NAME"
+_u_iface=""
+
+# cloud default when nothing is self-hosted
+NB_MANAGEMENT_URL=""; NB_DNS_DOMAIN=""
+assert_eq "cloud DNS domain derived" "netbird.cloud" "$(_derive_dns_domain)"
+
+printf '\n== uci section lookup ==\n'
+# The helpers must scan `uci show`, not walk indices with `uci get`: a section missing the probed
+# option would end the walk early and hide every section after it.
+# shellcheck disable=SC2329,SC2317  # invoked indirectly, from the sourced script's helpers
+uci() {
+    [ "$1" = "-q" ] && shift
+    [ "$1" = "show" ] || return 1
+    cat <<'UCI'
+firewall.@zone[0]=zone
+firewall.@zone[0].name='lan'
+firewall.@zone[1]=zone
+firewall.@zone[2]=zone
+firewall.@zone[2].name='netbird'
+firewall.@forwarding[0]=forwarding
+firewall.@forwarding[0].src='lan'
+firewall.@forwarding[0].dest='wan'
+firewall.@forwarding[1]=forwarding
+firewall.@forwarding[1].src='lan'
+firewall.@forwarding[1].dest='netbird'
+UCI
+}
+assert_eq "zone found past an unnamed section" "2" "$(_uci_zone_index)"
+assert_eq "first netbird forwarding found"     "1" "$(_uci_forwarding_netbird_index)"
+unset -f uci 2>/dev/null || uci() { return 1; }
 
 printf '\n== summary ==\n'
 printf '  %s passed, %s failed\n\n' "$PASS" "$FAIL"
