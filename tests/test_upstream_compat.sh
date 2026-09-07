@@ -62,7 +62,7 @@ done
 
 printf '\n== real download + verify ==\n'
 [ -n "$SMALLEST_ASSET" ] || SMALLEST_ASSET=$(asset_name "$LATEST" amd64)
-mkdir -p "$TMP_DIR" || exit 1
+_ensure_tmp_dir || exit 1
 URL="https://github.com/${NB_REPO}/releases/download/${LATEST}/${SMALLEST_ASSET}"
 OUT="${TMP_DIR}/${SMALLEST_ASSET}"
 if curl -fL --connect-timeout 15 --max-time 600 -o "$OUT" "$URL" 2>/dev/null; then

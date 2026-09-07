@@ -82,7 +82,7 @@
 #      log target are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 # ── Tunables ──────────────────────────────────────────
 # Sentinels record whether the user set the var explicitly; after detect_system, procd applies
@@ -93,6 +93,19 @@ _u_resolver=${NB_DNS_RESOLVER_ADDRESS:+1}
 _u_logpath=${LOG_FILE:+1}
 _u_iface=${NB_INTERFACE_NAME:+1}
 _u_mgmt=${NB_MANAGEMENT_URL:+1}
+_u_config=${NB_CONFIG_FILE+x}
+_u_addr=${NB_DAEMON_ADDR+x}
+_u_level=${NB_LOG_LEVEL+x}
+_u_disable_dns=${NB_DISABLE_DNS+x}
+_u_disable_client_routes=${NB_DISABLE_CLIENT_ROUTES+x}
+_u_disable_server_routes=${NB_DISABLE_SERVER_ROUTES+x}
+_u_disable_firewall=${NB_DISABLE_FIREWALL+x}
+_u_disable_ipv6=${NB_DISABLE_IPV6+x}
+_u_block_inbound=${NB_BLOCK_INBOUND+x}
+_u_block_lan_access=${NB_BLOCK_LAN_ACCESS+x}
+_u_allow_server_ssh=${NB_ALLOW_SERVER_SSH+x}
+_u_enable_rosenpass=${NB_ENABLE_ROSENPASS+x}
+_u_rosenpass_permissive=${NB_ROSENPASS_PERMISSIVE+x}
 
 NB_REPO="netbirdio/netbird"
 NB_BACKUP_KEEP="${NB_BACKUP_KEEP:-3}"            # backups kept for the binary
@@ -103,7 +116,7 @@ NB_ALLOW_PRERELEASE="${NB_ALLOW_PRERELEASE:-0}"
 NB_ALLOW_UNVERIFIED="${NB_ALLOW_UNVERIFIED:-0}"
 NB_ARCH="${NB_ARCH:-}"
 LOG_FILE="${LOG_FILE:-/var/log/netbird-manager.log}"
-TMP_DIR="/tmp/nb_mgr_$$"
+TMP_DIR=""  # allocated lazily by mktemp, never reuse a predictable /tmp directory
 
 # GitHub access — mirror/proxy/token/integrity/cache (all optional; empty = plain github.com)
 NB_GITHUB_API="${NB_GITHUB_API:-https://api.github.com}"  # API base (override for a mirror)
@@ -116,7 +129,7 @@ NB_GITHUB_MIRRORS="${NB_GITHUB_MIRRORS-https://ghfast.top https://gh-proxy.com}"
 NB_GITHUB_TOKEN="${NB_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
 NB_SHA256="${NB_SHA256:-}"
 NB_CACHE_TTL="${NB_CACHE_TTL:-600}"
-CACHE_DIR="${NB_CACHE_DIR:-${TMPDIR:-/tmp}/nb_mgr_cache}"  # persists across runs (not wiped)
+CACHE_DIR="${NB_CACHE_DIR:-${NB_ETC_DIR:-/etc/netbird}/manager-cache}"  # trusted parent; /var may point into /tmp on routers
 
 # Install layout
 NB_BIN_DIR="${NB_BIN_DIR:-/usr/bin}"
@@ -286,13 +299,22 @@ _log() {
 #     the target is either the complete old file or the complete new one — never truncated.
 # ==============================================================================
 _cleanup() {
-    if [ -d "$TMP_DIR" ]; then
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] && [ ! -L "$TMP_DIR" ]; then
         # the staged setup key lives here; overwrite before unlinking where possible
         find "$TMP_DIR" -type f -name '*.key' -exec sh -c ': > "$1"' _ {} \; 2>/dev/null || true
         rm -rf "$TMP_DIR" 2>/dev/null || true
     fi
     rm -f "${NB_ETC_DIR}"/*.tmp.$$ "${NB_BIN_DIR}"/*.tmp.$$ \
           "${NB_INITD_DIR}"/*.tmp.$$ "${NB_SYSTEMD_DIR}"/*.tmp.$$ 2>/dev/null || true
+}
+
+_ensure_tmp_dir() {
+    if [ -n "$TMP_DIR" ]; then
+        [ -d "$TMP_DIR" ] && [ ! -L "$TMP_DIR" ]
+        return $?
+    fi
+    TMP_DIR=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/nb_mgr.XXXXXXXXXX") || return 1
+    [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]
 }
 
 _on_signal() {
@@ -482,14 +504,17 @@ _pids_of() {
 _daemon_running() { [ -n "$(_pids_of)" ]; }
 
 # Run the netbird CLI with the configured daemon socket.
-_nb() {
+_nb() (
+    # NetBird imports NB_/WT_ variables itself. A setup key inherited here conflicts
+    # with --setup-key-file, even though we never put --setup-key in argv.
+    unset NB_SETUP_KEY WT_SETUP_KEY NB_SETUP_KEY_FILE WT_SETUP_KEY_FILE
     [ -x "$NB_BIN" ] || return 127
     if [ -n "$NB_DAEMON_ADDR" ]; then
         "$NB_BIN" --daemon-addr "$NB_DAEMON_ADDR" "$@"
     else
         "$NB_BIN" "$@"
     fi
-}
+)
 
 installed_version() {
     [ -x "$NB_BIN" ] || return 1
@@ -563,6 +588,9 @@ is_safe_arg_value() {
 }
 _is_uint() { printf '%s' "$1" | grep -qE '^[0-9]+$'; }
 _bool_value() { case "$1" in 1|true|yes|on|y|Y) return 0 ;; *) return 1 ;; esac; }
+_write_bool_arg() {
+    printf '%s=%s\n' "$1" "$(_bool_value "$2" && printf true || printf false)"
+}
 
 # systemd needs literal % doubled in ExecStart
 _systemd_escape_args() { printf '%s' "$1" | sed 's/%/%%/g'; }
@@ -647,26 +675,29 @@ svc_file_path() {
 svc_stop() {
     local f; f=$(svc_file_path)
     case "$INIT_SYS" in
-        procd)   if [ -x "$f" ]; then "$f" stop 2>/dev/null || true; fi ;;
-        systemd) systemctl stop "$NB_SERVICE_NAME" 2>/dev/null || true ;;
-        openrc)  rc-service "$NB_SERVICE_NAME" stop 2>/dev/null || true ;;
+        procd)   if [ -x "$f" ]; then "$f" stop; else ! _daemon_running; fi ;;
+        systemd) systemctl stop "$NB_SERVICE_NAME" ;;
+        openrc)  rc-service "$NB_SERVICE_NAME" stop ;;
+        *) return 1 ;;
     esac
 }
 svc_start() {
     case "$INIT_SYS" in
-        procd)   "$(svc_file_path)" enable && "$(svc_file_path)" start ;;
-        systemd) systemctl daemon-reload && systemctl enable "$NB_SERVICE_NAME" && systemctl start "$NB_SERVICE_NAME" ;;
-        openrc)  rc-update add "$NB_SERVICE_NAME" default 2>/dev/null; rc-service "$NB_SERVICE_NAME" start ;;
+        procd)   "$(svc_file_path)" enable && "$(svc_file_path)" start || return 1 ;;
+        systemd) systemctl daemon-reload && systemctl enable "$NB_SERVICE_NAME" && systemctl start "$NB_SERVICE_NAME" || return 1 ;;
+        openrc)  rc-update add "$NB_SERVICE_NAME" default && rc-service "$NB_SERVICE_NAME" start || return 1 ;;
         *) return 1 ;;
     esac
+    wait_daemon 20
 }
 svc_restart() {
     case "$INIT_SYS" in
-        procd)   "$(svc_file_path)" restart ;;
-        systemd) systemctl restart "$NB_SERVICE_NAME" ;;
-        openrc)  rc-service "$NB_SERVICE_NAME" restart ;;
+        procd)   "$(svc_file_path)" restart || return 1 ;;
+        systemd) systemctl daemon-reload && systemctl restart "$NB_SERVICE_NAME" || return 1 ;;
+        openrc)  rc-service "$NB_SERVICE_NAME" restart || return 1 ;;
         *) return 1 ;;
     esac
+    wait_daemon 20
 }
 svc_remove() {
     local f; f=$(svc_file_path)
@@ -1006,7 +1037,7 @@ do_download() {
     [ "$ARCH_NAME" = "unknown" ] && { msg_err "$(t "Unsupported architecture" "架构不受支持")"; return 1; }
     ASSET=$(asset_name "$VER" "$ARCH_NAME")
 
-    mkdir -p "$TMP_DIR" || return 1
+    _ensure_tmp_dir || return 1
     _check_space "$TMP_DIR" "$NB_MIN_TMP_MB" || return 1
 
     local base="https://github.com/${NB_REPO}/releases/download/${VER}/${ASSET}"
@@ -1092,7 +1123,11 @@ do_install_bin() {
 
     local was_running=0
     _daemon_running && was_running=1
-    [ "$was_running" = 1 ] && { msg_info "$(t "Stopping the service to replace the binary" "停止服务以替换二进制")"; svc_stop; sleep 1; }
+    if [ "$was_running" = 1 ]; then
+        msg_info "$(t "Stopping the service to replace the binary" "停止服务以替换二进制")"
+        svc_stop || return 1
+        sleep 1
+    fi
 
     crit_begin
     if [ -f "$NB_BIN" ] && [ "$NB_BACKUP_KEEP" -gt 0 ]; then
@@ -1109,7 +1144,8 @@ do_install_bin() {
     _prune_backups
 
     msg_ok "$(printf "$(t "Installed %s → %s" "已安装 %s → %s")" "$(installed_version)" "$NB_BIN")"
-    [ "$was_running" = 1 ] && svc_start > /dev/null 2>&1
+    # The install/update flow restarts only after writing the matching daemon args
+    # and service file (an explicit socket change must not probe the old service).
     return 0
 }
 
@@ -1121,12 +1157,54 @@ do_install_bin() {
 # run's defaults (wt0, cloud, no resolver) instead of on what is actually deployed: the firewall
 # zone would bind the wrong interface and the dnsmasq entry would forward the wrong domain.
 # Values given explicitly through the environment still win.
+_load_saved_daemon_args() {
+    [ -r "$NB_DAEMON_ARGS_FILE" ] || return 0
+    local key='' line=''
+    while IFS= read -r line; do
+        if [ -n "$key" ]; then
+            case "$key" in
+                --config)      [ -n "$_u_config" ]  || NB_CONFIG_FILE="$line" ;;
+                --daemon-addr) [ -n "$_u_addr" ]    || NB_DAEMON_ADDR="$line" ;;
+                --log-level)   [ -n "$_u_level" ]   || NB_LOG_LEVEL="$line" ;;
+                --log-file)    [ -n "$_u_logfile" ] || NB_LOG_FILE="$line" ;;
+            esac
+            key=''
+        else
+            case "$line" in --*) key="$line" ;; esac
+        fi
+    done < "$NB_DAEMON_ARGS_FILE"
+    return 0
+}
+
+# Both legacy bare flags and new explicit true/false flags are accepted. Preserve
+# saved choices that the wizard does not ask about; explicit environment values win.
+_load_saved_bool() {
+    case "$1" in
+        --disable-dns)           [ -n "$_u_disable_dns" ]           || NB_DISABLE_DNS="$2" ;;
+        --disable-client-routes) [ -n "$_u_disable_client_routes" ] || NB_DISABLE_CLIENT_ROUTES="$2" ;;
+        --disable-server-routes) [ -n "$_u_disable_server_routes" ] || NB_DISABLE_SERVER_ROUTES="$2" ;;
+        --disable-firewall)      [ -n "$_u_disable_firewall" ]      || NB_DISABLE_FIREWALL="$2" ;;
+        --disable-ipv6)          [ -n "$_u_disable_ipv6" ]          || NB_DISABLE_IPV6="$2" ;;
+        --block-inbound)         [ -n "$_u_block_inbound" ]         || NB_BLOCK_INBOUND="$2" ;;
+        --block-lan-access)      [ -n "$_u_block_lan_access" ]      || NB_BLOCK_LAN_ACCESS="$2" ;;
+        --allow-server-ssh)      [ -n "$_u_allow_server_ssh" ]      || NB_ALLOW_SERVER_SSH="$2" ;;
+        --enable-rosenpass)      [ -n "$_u_enable_rosenpass" ]      || NB_ENABLE_ROSENPASS="$2" ;;
+        --rosenpass-permissive)  [ -n "$_u_rosenpass_permissive" ]  || NB_ROSENPASS_PERMISSIVE="$2" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
 load_saved_args() {
+    _load_saved_daemon_args
     [ -r "$NB_UP_ARGS_FILE" ] || return 0
     local key='' line=''
     while IFS= read -r line; do
         case "$line" in
-            --*) key="$line"; continue ;;   # a bool flag is simply replaced by the next key
+            --*=*) _load_saved_bool "${line%%=*}" "${line#*=}" || true
+                   key=''; continue ;;
+            --*)   if _load_saved_bool "$line" true; then key=''; else key="$line"; fi
+                   continue ;;
         esac
         [ -n "$key" ] || continue
         case "$key" in
@@ -1199,21 +1277,33 @@ _up_wizard() {
             NB_WIREGUARD_PORT=$(_read_text "$(t "WireGuard port (Enter = default 51820)" \
                                                 "WireGuard 端口（回车 = 默认 51820）")" "$NB_WIREGUARD_PORT")
             NB_MTU=$(_read_text "$(t "MTU (Enter = default)" "MTU（回车 = 默认）")" "$NB_MTU")
-            _ask_flag "$(t "Act as a routing peer (share this LAN with the mesh)?" \
-                           "作为路由节点（把本地网络共享给网络）？")" y || NB_DISABLE_SERVER_ROUTES=1
-            _ask_flag "$(t "Accept routes advertised by other peers?" "接受其他节点发布的路由？")" y \
-                || NB_DISABLE_CLIENT_ROUTES=1
-            _ask_flag "$(t "Let NetBird manage DNS?" "允许 NetBird 管理 DNS？")" y || NB_DISABLE_DNS=1
-            _ask_flag "$(t "Enable NetBird's built-in SSH server?" "启用 NetBird 内置 SSH 服务？")" n \
-                && NB_ALLOW_SERVER_SSH=1
-            _ask_flag "$(t "Enable Rosenpass (post-quantum key exchange)?" "启用 Rosenpass（抗量子密钥交换）？")" n \
-                && NB_ENABLE_ROSENPASS=1
+            if _ask_flag "$(t "Act as a routing peer (share this LAN with the mesh)?" \
+                              "作为路由节点（把本地网络共享给网络）？")" \
+                         "$(_bool_value "$NB_DISABLE_SERVER_ROUTES" && printf n || printf y)"; then
+                NB_DISABLE_SERVER_ROUTES=0
+            else NB_DISABLE_SERVER_ROUTES=1; fi
+            if _ask_flag "$(t "Accept routes advertised by other peers?" "接受其他节点发布的路由？")" \
+                         "$(_bool_value "$NB_DISABLE_CLIENT_ROUTES" && printf n || printf y)"; then
+                NB_DISABLE_CLIENT_ROUTES=0
+            else NB_DISABLE_CLIENT_ROUTES=1; fi
+            if _ask_flag "$(t "Let NetBird manage DNS?" "允许 NetBird 管理 DNS？")" \
+                         "$(_bool_value "$NB_DISABLE_DNS" && printf n || printf y)"; then
+                NB_DISABLE_DNS=0
+            else NB_DISABLE_DNS=1; fi
+            if _ask_flag "$(t "Enable NetBird's built-in SSH server?" "启用 NetBird 内置 SSH 服务？")" \
+                         "$(_bool_value "$NB_ALLOW_SERVER_SSH" && printf y || printf n)"; then
+                NB_ALLOW_SERVER_SSH=1
+            else NB_ALLOW_SERVER_SSH=0; fi
+            if _ask_flag "$(t "Enable Rosenpass (post-quantum key exchange)?" "启用 Rosenpass（抗量子密钥交换）？")" \
+                         "$(_bool_value "$NB_ENABLE_ROSENPASS" && printf y || printf n)"; then
+                NB_ENABLE_ROSENPASS=1
+            else NB_ENABLE_ROSENPASS=0; fi
         fi
     fi
 
     # OpenWrt: dnsmasq already owns :53, so pin NetBird's resolver to an alternative port unless
     # DNS management is off or the user pinned an address explicitly.
-    if [ "$INIT_SYS" = "procd" ] && [ "$NB_DISABLE_DNS" != "1" ] && \
+    if [ "$INIT_SYS" = "procd" ] && ! _bool_value "$NB_DISABLE_DNS" && \
        [ -z "$NB_DNS_RESOLVER_ADDRESS" ] && [ -z "$_u_resolver" ]; then
         NB_DNS_RESOLVER_ADDRESS="127.0.0.1:5053"
     fi
@@ -1271,16 +1361,16 @@ write_up_args() {
         # a cobra bool flag needs the =value form; "--flag value" would be read as an argument
         [ -n "$NB_NETWORK_MONITOR" ]      && printf -- '--network-monitor=%s\n' \
             "$(_bool_value "$NB_NETWORK_MONITOR" && printf 'true' || printf 'false')"
-        _bool_value "$NB_DISABLE_DNS"            && printf -- '--disable-dns\n'
-        _bool_value "$NB_DISABLE_CLIENT_ROUTES"  && printf -- '--disable-client-routes\n'
-        _bool_value "$NB_DISABLE_SERVER_ROUTES"  && printf -- '--disable-server-routes\n'
-        _bool_value "$NB_DISABLE_FIREWALL"       && printf -- '--disable-firewall\n'
-        _bool_value "$NB_DISABLE_IPV6"           && printf -- '--disable-ipv6\n'
-        _bool_value "$NB_BLOCK_INBOUND"          && printf -- '--block-inbound\n'
-        _bool_value "$NB_BLOCK_LAN_ACCESS"       && printf -- '--block-lan-access\n'
-        _bool_value "$NB_ALLOW_SERVER_SSH"       && printf -- '--allow-server-ssh\n'
-        _bool_value "$NB_ENABLE_ROSENPASS"       && printf -- '--enable-rosenpass\n'
-        _bool_value "$NB_ROSENPASS_PERMISSIVE"   && printf -- '--rosenpass-permissive\n'
+        _write_bool_arg --disable-dns           "$NB_DISABLE_DNS"
+        _write_bool_arg --disable-client-routes "$NB_DISABLE_CLIENT_ROUTES"
+        _write_bool_arg --disable-server-routes "$NB_DISABLE_SERVER_ROUTES"
+        _write_bool_arg --disable-firewall      "$NB_DISABLE_FIREWALL"
+        _write_bool_arg --disable-ipv6          "$NB_DISABLE_IPV6"
+        _write_bool_arg --block-inbound         "$NB_BLOCK_INBOUND"
+        _write_bool_arg --block-lan-access      "$NB_BLOCK_LAN_ACCESS"
+        _write_bool_arg --allow-server-ssh      "$NB_ALLOW_SERVER_SSH"
+        _write_bool_arg --enable-rosenpass       "$NB_ENABLE_ROSENPASS"
+        _write_bool_arg --rosenpass-permissive  "$NB_ROSENPASS_PERMISSIVE"
         [ -n "$NB_CONFIG_FILE" ]                 && printf -- '--config\n%s\n' "$NB_CONFIG_FILE"
         true
     } >> "$tmp"
@@ -1302,11 +1392,14 @@ do_connect() {
                       "配置已写入，稍后运行本脚本的 up 子命令即可连接。")"
         return 0; }
 
+    if [ -z "$NB_AUTH" ] && { [ -n "$NB_SETUP_KEY" ] || [ -n "$NB_SETUP_KEY_FILE" ]; }; then
+        NB_AUTH=key
+    fi
     if ! _daemon_running; then
         msg_info "$(t "Starting the NetBird service…" "正在启动 NetBird 服务…")"
-        svc_start > /dev/null 2>&1 || true
+        svc_start || return 1
     fi
-    wait_daemon 20 || msg_warn "$(t "The daemon did not answer yet; continuing anyway" "守护进程尚未响应，仍继续尝试")"
+    wait_daemon 20 || { msg_err "$(t "The daemon did not answer" "守护进程未响应")"; return 1; }
 
     # Build the argument list from up.args (a redirect, not a pipe, so `set --` stays in this shell)
     set --
@@ -1323,7 +1416,7 @@ do_connect() {
             keyfile="$NB_SETUP_KEY_FILE"
         else
             [ -n "$NB_SETUP_KEY" ] || { msg_err "$(t "No setup key given" "未提供 Setup Key")"; return 1; }
-            mkdir -p "$TMP_DIR" || return 1
+            _ensure_tmp_dir || return 1
             keyfile="${TMP_DIR}/setup.key"
             ( umask 077; printf '%s\n' "$NB_SETUP_KEY" > "$keyfile" ) || return 1
         fi
@@ -1409,9 +1502,17 @@ openwrt_dns_setup() {
     fi
     uci add_list "dhcp.@dnsmasq[0].server=${entry}" || return 1
     uci commit dhcp || return 1
-    /etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
+    "${NB_INITD_DIR}/dnsmasq" restart || return 1
     msg_ok "$(printf "$(t "dnsmasq now forwards %s to %s" "dnsmasq 已将 %s 转发到 %s")" "$domain" "$NB_DNS_RESOLVER_ADDRESS")"
     return 0
+}
+
+_openwrt_reload_network() {
+    "${NB_INITD_DIR}/network" reload || return 1
+    # netifd must know the logical interface before fw3/fw4 resolves zone networks.
+    if [ "${1:-}" = netbird ]; then
+        ubus -S call network.interface.netbird status > /dev/null || return 1
+    fi
 }
 
 openwrt_firewall_setup() {
@@ -1420,27 +1521,28 @@ openwrt_firewall_setup() {
 
     # network interface — proto none, NetBird owns the device
     if [ "$(uci -q get network.netbird 2>/dev/null)" != "interface" ]; then
-        uci set network.netbird=interface
-        uci set network.netbird.proto='none'
-        uci set network.netbird.device="$iface"
-        uci commit network
+        uci set network.netbird=interface || return 1
+        uci set network.netbird.proto='none' || return 1
+        uci set network.netbird.device="$iface" || return 1
+        uci commit network || return 1
         msg_ok "$(printf "$(t "Network interface 'netbird' bound to %s" "网络接口 netbird 已绑定 %s")" "$iface")"
     else
-        uci set network.netbird.device="$iface"
-        uci commit network
+        uci set network.netbird.device="$iface" || return 1
+        uci commit network || return 1
         msg_info "$(t "Network interface 'netbird' already present" "网络接口 netbird 已存在")"
     fi
+    _openwrt_reload_network netbird || return 1
 
     if _uci_zone_index > /dev/null; then
         msg_info "$(t "Firewall zone 'netbird' already present" "防火墙区域 netbird 已存在")"
     else
-        uci add firewall zone > /dev/null
-        uci set firewall.@zone[-1].name='netbird'
-        uci set firewall.@zone[-1].input='ACCEPT'
-        uci set firewall.@zone[-1].output='ACCEPT'
-        uci set firewall.@zone[-1].forward='ACCEPT'
-        uci set firewall.@zone[-1].masq='1'
-        uci add_list firewall.@zone[-1].network='netbird'
+        uci add firewall zone > /dev/null || return 1
+        uci set firewall.@zone[-1].name='netbird' || return 1
+        uci set firewall.@zone[-1].input='ACCEPT' || return 1
+        uci set firewall.@zone[-1].output='ACCEPT' || return 1
+        uci set firewall.@zone[-1].forward='ACCEPT' || return 1
+        uci set firewall.@zone[-1].masq='1' || return 1
+        uci add_list firewall.@zone[-1].network='netbird' || return 1
         msg_ok "$(t "Firewall zone 'netbird' created" "已创建防火墙区域 netbird")"
         msg_warn "$(t "The zone accepts all traffic on the tunnel; NetBird access policies are what restrict it." \
                       "该区域放行隧道上的全部流量，实际限制由 NetBird 的访问策略决定。")"
@@ -1449,21 +1551,21 @@ openwrt_firewall_setup() {
     if _ask_flag "$(t "Allow LAN → NetBird (local devices reach the mesh)?" \
                       "允许 LAN → NetBird（本地设备访问网络）？")" y; then
         _uci_forwarding_exists lan netbird || {
-            uci add firewall forwarding > /dev/null
-            uci set firewall.@forwarding[-1].src='lan'
-            uci set firewall.@forwarding[-1].dest='netbird'
+            uci add firewall forwarding > /dev/null || return 1
+            uci set firewall.@forwarding[-1].src='lan' || return 1
+            uci set firewall.@forwarding[-1].dest='netbird' || return 1
         }
     fi
     if _ask_flag "$(t "Allow NetBird → LAN (peers reach your local network)?" \
                       "允许 NetBird → LAN（远端节点访问本地网络）？")" y; then
         _uci_forwarding_exists netbird lan || {
-            uci add firewall forwarding > /dev/null
-            uci set firewall.@forwarding[-1].src='netbird'
-            uci set firewall.@forwarding[-1].dest='lan'
+            uci add firewall forwarding > /dev/null || return 1
+            uci set firewall.@forwarding[-1].src='netbird' || return 1
+            uci set firewall.@forwarding[-1].dest='lan' || return 1
         }
     fi
     uci commit firewall || return 1
-    /etc/init.d/firewall restart > /dev/null 2>&1 || true
+    "${NB_INITD_DIR}/firewall" restart || return 1
     msg_ok "$(t "Firewall updated" "防火墙已更新")"
     msg_info "$(t "Finally, add this router's LAN subnet as a network resource in the dashboard." \
                   "最后请在控制台把本路由器的局域网网段添加为网络资源。")"
@@ -1474,25 +1576,29 @@ openwrt_revert() {
     command -v uci > /dev/null 2>&1 || return 0
     local i domain e
     domain=$(_derive_dns_domain)
-    uci -q delete network.netbird 2>/dev/null && uci commit network
+    if uci -q get network.netbird > /dev/null 2>&1; then
+        uci -q delete network.netbird || return 1
+        uci commit network || return 1
+        _openwrt_reload_network || return 1
+    fi
     while i=$(_uci_zone_index); do
-        uci -q delete "firewall.@zone[$i]" 2>/dev/null || break
+        uci -q delete "firewall.@zone[$i]" || return 1
     done
     # deleting a section renumbers the ones after it, so always re-find the first match
     while i=$(_uci_forwarding_netbird_index); do
-        uci -q delete "firewall.@forwarding[$i]" 2>/dev/null || break
+        uci -q delete "firewall.@forwarding[$i]" || return 1
     done
-    uci commit firewall 2>/dev/null || true
+    uci commit firewall || return 1
     # Match the entry by domain, not by rebuilding the string from NB_DNS_RESOLVER_ADDRESS: on an
     # uninstall run that variable may be empty or hold a different port than the one installed.
     for e in $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null); do
         case "$e" in
-            "/${domain}/"*) uci -q del_list "dhcp.@dnsmasq[0].server=${e}" 2>/dev/null ;;
+            "/${domain}/"*) uci -q del_list "dhcp.@dnsmasq[0].server=${e}" || return 1 ;;
         esac
     done
-    uci commit dhcp 2>/dev/null || true
-    /etc/init.d/firewall restart > /dev/null 2>&1 || true
-    /etc/init.d/dnsmasq restart > /dev/null 2>&1 || true
+    uci commit dhcp || return 1
+    "${NB_INITD_DIR}/firewall" restart || return 1
+    "${NB_INITD_DIR}/dnsmasq" restart || return 1
     msg_ok "$(t "OpenWrt network/firewall/DNS entries reverted" "OpenWrt 网络/防火墙/DNS 配置已还原")"
 }
 
@@ -1512,7 +1618,7 @@ openwrt_menu() {
     case "$ans" in
         1) openwrt_dns_setup ;;
         2) openwrt_firewall_setup ;;
-        3) openwrt_dns_setup; openwrt_firewall_setup ;;
+        3) openwrt_dns_setup && openwrt_firewall_setup ;;
         4) _ask_flag "$(t "Really revert?" "确认还原？")" n && openwrt_revert ;;
         *) return 0 ;;
     esac
@@ -1559,7 +1665,7 @@ do_uninstall() {
     if [ -x "$NB_BIN" ] && _daemon_running; then
         _nb down > /dev/null 2>&1 || true
     fi
-    svc_stop
+    svc_stop || return 1
     svc_remove
     msg_ok "$(t "Service removed" "服务已移除")"
 
@@ -1579,7 +1685,7 @@ do_uninstall() {
     fi
     if [ "$INIT_SYS" = "procd" ] && _ask_flag "$(t "Revert the OpenWrt network/firewall/DNS entries?" \
                                                    "还原 OpenWrt 网络/防火墙/DNS 配置？")" n; then
-        openwrt_revert
+        openwrt_revert || return 1
     fi
     msg_ok "$(t "Done" "完成")"
     return 0
@@ -1607,25 +1713,27 @@ do_install() {
     _up_wizard      || return 1
     write_up_args   || return 1
 
-    svc_start > /dev/null 2>&1 || msg_warn "$(t "Could not start the service automatically" "未能自动启动服务")"
+    svc_start || return 1
     do_connect || return 1
 
     if [ "$INIT_SYS" = "procd" ]; then
         if [ "${NB_NONINTERACTIVE:-0}" = "1" ]; then
-            _bool_value "$NB_OPENWRT_DNS"      && openwrt_dns_setup
-            _bool_value "$NB_OPENWRT_FIREWALL" && openwrt_firewall_setup
+            if _bool_value "$NB_OPENWRT_DNS"; then openwrt_dns_setup || return 1; fi
+            if _bool_value "$NB_OPENWRT_FIREWALL"; then openwrt_firewall_setup || return 1; fi
         else
             printf '\n'
-            _ask_flag "$(t "Set up dnsmasq forwarding for NetBird DNS?" "是否配置 dnsmasq 转发 NetBird DNS？")" y \
-                && openwrt_dns_setup
-            _ask_flag "$(t "Set up the firewall so your LAN can use the mesh?" \
-                           "是否配置防火墙，使局域网可以使用该网络？")" y \
-                && openwrt_firewall_setup
+            if _ask_flag "$(t "Set up dnsmasq forwarding for NetBird DNS?" "是否配置 dnsmasq 转发 NetBird DNS？")" y; then
+                openwrt_dns_setup || return 1
+            fi
+            if _ask_flag "$(t "Set up the firewall so your LAN can use the mesh?" \
+                              "是否配置防火墙，使局域网可以使用该网络？")" y; then
+                openwrt_firewall_setup || return 1
+            fi
         fi
     fi
 
     printf '\n'
-    do_status > /dev/null 2>&1
+    if [ "$NB_AUTH" != none ]; then do_status > /dev/null 2>&1 || return 1; fi
     msg_ok "$(t "Installation finished" "安装完成")"
     return 0
 }
@@ -1639,7 +1747,7 @@ do_update() {
     do_install_bin || return 1
     write_daemon_args || return 1
     svc_write         || return 1
-    svc_restart > /dev/null 2>&1 || true
+    svc_restart || return 1
     msg_ok "$(t "Update finished" "更新完成")"
     return 0
 }
@@ -1650,7 +1758,7 @@ do_reconfigure() {
     write_up_args || return 1
     write_daemon_args || return 1
     svc_write     || return 1
-    svc_restart > /dev/null 2>&1 || true
+    svc_restart || return 1
     do_connect
 }
 
@@ -1776,7 +1884,6 @@ show_version() {
 
 main() {
     detect_system || true
-    load_saved_args
 
     # procd tightening: routers have little flash and a tmpfs /var, so keep one backup and let
     # procd own the log stream instead of writing a rotating file into RAM.
@@ -1785,6 +1892,7 @@ main() {
         [ -n "$_u_logfile" ] || NB_LOG_FILE="console"
         [ -n "$_u_logpath" ] || LOG_FILE="/tmp/netbird-manager.log"
     fi
+    load_saved_args
 
     case "${1:-}" in
         help|-h|--help)  show_help; exit 0 ;;

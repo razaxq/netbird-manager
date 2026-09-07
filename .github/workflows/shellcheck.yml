@@ -40,6 +40,7 @@ jobs:
             echo "--- $interp -n"
             $interp -n netbird.sh
             $interp -n tests/test_manager.sh
+            $interp -n tests/test_regressions.sh
           done
 
       - name: Unit tests under every target shell
@@ -48,6 +49,7 @@ jobs:
           for interp in "sh" "dash" "busybox sh"; do
             echo "=== $interp tests/test_manager.sh"
             $interp tests/test_manager.sh
+            $interp tests/test_regressions.sh
           done
 
       - name: Subcommands that must work without root
