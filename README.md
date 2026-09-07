@@ -168,6 +168,7 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 | `NB_GITHUB_MIRRORS` | Fallback prefixes tried in order after a direct attempt fails; empty disables the fallback | `https://ghfast.top https://gh-proxy.com` |
 | `NB_GITHUB_API` / `NB_GITHUB_TOKEN` | API base / PAT (lifts the 60-per-hour anonymous limit) | official / empty |
 | `NB_CACHE_TTL` | Seconds to cache the release list (`0` disables) | `600` |
+| `NB_CACHE_DIR` | Release-list cache directory; use a trusted, private parent when overriding | `/etc/netbird/manager-cache` |
 | `NB_MIN_TMP_MB` / `NB_MIN_BIN_MB` | Free space required in `/tmp` and in the install directory | `110` / `60` |
 
 ### Runtime and maintenance
@@ -206,10 +207,15 @@ Issues and PRs are welcome. Local checks:
 ```sh
 shellcheck -s sh netbird.sh tests/*.sh
 sh tests/test_manager.sh           # offline unit tests
+sh tests/test_regressions.sh       # isolated install/configuration/service flow regressions
 sh tests/test_upstream_compat.sh   # needs network; downloads one real release asset
 ```
 
 CI runs ShellCheck and the unit tests under `sh`, `dash` and `busybox sh`; a weekly job verifies the upstream release matrix, the published digests and the archive layout.
+
+Updates restore the saved daemon configuration, socket and log settings; explicit environment values override them. Boolean connection settings are saved as explicit `true`/`false` options so reconfiguration can turn features off as well as on. Service operations return failure if the service command fails or the daemon does not become ready. OpenWrt firewall setup reloads the network configuration before applying the zone.
+
+On Git for Windows, the tests explicitly skip Unix file-mode assertions; Linux CI still enforces them. For a downloaded official client, set `NB_TEST_REAL_BIN=/path/to/netbird` when running `test_regressions.sh` to also check key-file argument compatibility without connecting or installing a service.
 
 > ⚠️ Both languages are inlined in `t "en" "zh"` calls — **change them together**.
 

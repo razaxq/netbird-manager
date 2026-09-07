@@ -168,6 +168,7 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 | `NB_GITHUB_MIRRORS` | 直连失败后依次尝试的前缀；留空则关闭兜底 | `https://ghfast.top https://gh-proxy.com` |
 | `NB_GITHUB_API` / `NB_GITHUB_TOKEN` | API 地址 / PAT（解除每小时 60 次的匿名限制） | 官方 / 空 |
 | `NB_CACHE_TTL` | Release 列表缓存秒数（`0` 关闭） | `600` |
+| `NB_CACHE_DIR` | Release 列表缓存目录；覆盖时应使用可信的私有父目录 | `/etc/netbird/manager-cache` |
 | `NB_MIN_TMP_MB` / `NB_MIN_BIN_MB` | `/tmp` 与安装目录所需的空闲空间 | `110` / `60` |
 
 ### 运行与维护
@@ -206,10 +207,15 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 ```sh
 shellcheck -s sh netbird.sh tests/*.sh
 sh tests/test_manager.sh           # 离线单元测试
+sh tests/test_regressions.sh       # 隔离验证安装、配置和服务管理流程
 sh tests/test_upstream_compat.sh   # 需要网络；会真实下载一个 Release 文件
 ```
 
 CI 会在 `sh`、`dash`、`busybox sh` 下运行 ShellCheck 与单元测试；每周还有一个任务校验上游的架构矩阵、发布摘要与压缩包结构。
+
+更新时会恢复已保存的守护进程配置、socket 和日志设置，显式环境变量优先。连接功能开关以明确的 `true`/`false` 参数保存，重新配置时既能开启也能关闭。服务命令执行失败或守护进程未就绪时会返回失败。OpenWrt 防火墙设置会先重新加载网络配置，再应用区域规则。
+
+在 Git for Windows 下，测试会明确跳过 Unix 文件权限断言；Linux CI 仍会严格检查。若已下载官方客户端，可在运行 `test_regressions.sh` 时设置 `NB_TEST_REAL_BIN=/path/to/netbird`，额外验证密钥文件参数的兼容性；该验证不会连接网络或安装服务。
 
 > ⚠️ 两种语言都写在 `t "en" "zh"` 调用里 —— **改的时候请一起改**。
 

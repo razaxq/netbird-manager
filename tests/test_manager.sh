@@ -11,6 +11,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
 FAIL=0
 PASS=0
+SKIP=0
 
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
@@ -225,14 +226,17 @@ NB_SETUP_KEY="SUPER-SECRET-KEY"
 write_up_args >/dev/null 2>&1
 UP=$(cat "$NB_UP_ARGS_FILE")
 for want in "--management-url" "https://nb.example.com:443" "--hostname" "router-a" \
-            "--dns-resolver-address" "127.0.0.1:5053" "--disable-server-routes" \
+            "--dns-resolver-address" "127.0.0.1:5053" "--disable-server-routes=true" \
             "--network-monitor=true"; do
     if printf '%s\n' "$UP" | grep -qxF -- "$want"; then ok "up.args contains $want"
     else bad "up.args contains $want"; fi
 done
 if printf '%s\n' "$UP" | grep -q 'SUPER-SECRET-KEY'; then bad "setup key must never be written to disk"
 else ok "setup key is never written to disk"; fi
-assert_eq "up.args is owner-readable only" "600" "$(stat -c '%a' "$NB_UP_ARGS_FILE" 2>/dev/null)"
+case "$(uname -s)" in
+    MINGW*|MSYS*) SKIP=$((SKIP + 1)); printf '  SKIP Unix mode 0600 requires a Unix filesystem\n' ;;
+    *) assert_eq "up.args is owner-readable only" "600" "$(stat -c '%a' "$NB_UP_ARGS_FILE" 2>/dev/null)" ;;
+esac
 
 # a bad value must be rejected before anything is written
 NB_MTU="42"
@@ -298,5 +302,5 @@ assert_eq "first netbird forwarding found"     "1" "$(_uci_forwarding_netbird_in
 unset -f uci 2>/dev/null || uci() { return 1; }
 
 printf '\n== summary ==\n'
-printf '  %s passed, %s failed\n\n' "$PASS" "$FAIL"
+printf '  %s passed, %s failed, %s skipped\n\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]

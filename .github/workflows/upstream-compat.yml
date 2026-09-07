@@ -12,6 +12,8 @@ on:
     paths:
       - netbird.sh
       - tests/test_upstream_compat.sh
+      - tests/test_regressions.sh
+      - tests/test_systemd_smoke.sh
       - .github/workflows/upstream-compat.yml
 
 jobs:
@@ -47,3 +49,6 @@ jobs:
             "$NB_BIN" version
             cat "$(svc_file_path)"
           '
+          NB_TEST_REAL_BIN="$prefix/usr/bin/netbird" sh tests/test_regressions.sh
+          sudo env NB_CI_SYSTEMD_TEST=1 NB_TEST_REAL_BIN="$prefix/usr/bin/netbird" \
+            sh tests/test_systemd_smoke.sh
