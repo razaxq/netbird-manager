@@ -82,7 +82,7 @@
 #      log target are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 # ── Tunables ──────────────────────────────────────────
 # Sentinels record whether the user set the var explicitly; after detect_system, procd applies
@@ -1765,8 +1765,9 @@ do_reconfigure() {
 # ==============================================================================
 #  Menu
 # ==============================================================================
-_menu_rule() { printf '%s\n' '──────────────────────────────────────────'; }
-_menu_group() { printf '\n── %s ──\n\n' "$1"; }
+_menu_rule() { printf '  %b%s%b\n' "$C_BLD" '──────────────────────────────────────────' "$C_RST"; }
+_menu_group() { printf '  %b── %s ──%b\n' "$C_DIM" "$1" "$C_RST"; }
+_menu_item() { printf '  %b%s)%b  %s\n' "$C_BLD" "$1" "$C_RST" "$2"; }
 
 _menu_header() {
     local version status color config
@@ -1794,33 +1795,34 @@ _menu_header() {
 
     printf '\n'
     _menu_rule
-    printf "${C_BLD}NetBird Manager  v%s${C_RST}\n" "$SCRIPT_VERSION"
+    printf '    %bNetBird Manager%b  v%s\n' "$C_BLD" "$C_RST" "$SCRIPT_VERSION"
     _menu_rule
-    printf '%s  %-12s %s  %s\n' "$(t "System" "系统")" "$OS_TYPE" "$(t "Arch" "架构")" "$ARCH_NAME"
-    printf '%s  %s\n' "$(t "Init   " "服务管理")" "$INIT_SYS"
-    printf '%s  %s\n' "$(t "Version" "客户端版本")" "$version"
+    printf '  %s  %-12s  %s  %s\n' "$(t "System" "系统")" "$OS_TYPE" "$(t "Arch" "架构")" "$ARCH_NAME"
+    printf '  Init  %s\n' "$INIT_SYS"
+    printf '  %s  %s\n' "$(t "Version" "版本")" "$version"
     if [ -x "$NB_BIN" ]; then
-        printf '%s  %b%s%b\n' "$(t "Status " "状态")" "$color" "$status" "$C_RST"
+        printf '  %s  %b%s%b\n' "$(t "Status " "状态")" "$color" "$status" "$C_RST"
     fi
-    printf '%s  %s\n' "$(t "Config " "配置")" "$config"
+    printf '  %s  %s\n' "$(t "Config " "配置")" "$config"
     _menu_rule
 }
 
 _menu_options() {
-    _menu_group "$(t "Service" "服务")"
-    printf '%s\n\n' "$(t "1. View service status" "1. 查看服务状态")"
-    printf '%s\n\n' "$(t "2. Start / stop / restart" "2. 启动 / 停止 / 重启")"
-    printf '%s\n' "$(t "3. Disconnect (netbird down)" "3. 断开连接 (netbird down)")"
-    _menu_group "$(t "Configuration" "配置")"
-    printf '%s\n\n' "$(t "4. Configure and connect" "4. 配置并连接")"
-    printf '%s\n' "$(t "5. OpenWrt integration (DNS / firewall)" "5. OpenWrt 集成（DNS / 防火墙）")"
-    _menu_group "$(t "Maintenance" "维护")"
-    printf '%s\n\n' "$(t "6. Install / update (choose version)" "6. 安装 / 更新（选择版本）")"
-    printf '%s\n\n' "$(t "7. File locations & logs" "7. 文件位置与日志")"
-    printf '%s\n\n' "$(t "8. Uninstall NetBird" "8. 卸载 NetBird")"
-    printf '%s\n' "$(t "9. Exit" "9. 退出")"
     printf '\n'
-    _menu_rule
+    _menu_group "$(t "Service" "服务")"
+    _menu_item 1 "$(t "View service status" "查看服务状态")"
+    _menu_item 2 "$(t "Start / stop / restart" "启动 / 停止 / 重启")"
+    _menu_item 3 "$(t "Disconnect (netbird down)" "断开连接 (netbird down)")"
+    _menu_group "$(t "Configuration" "配置")"
+    _menu_item 4 "$(t "Configure and connect" "配置并连接")"
+    _menu_item 5 "$(t "OpenWrt integration (DNS / firewall)" "OpenWrt 集成（DNS / 防火墙）")"
+    _menu_group "$(t "Maintenance" "维护")"
+    _menu_item 6 "$(t "Install / update (choose version)" "安装 / 更新（选择版本）")"
+    _menu_item 7 "$(t "File locations & logs" "文件位置与日志")"
+    _menu_item 8 "$(t "Uninstall NetBird" "卸载 NetBird")"
+    printf '\n'
+    _menu_item 9 "$(t "Exit" "退出")"
+    printf '  %s\n' '─────────────────────────────────────────────────'
 }
 
 _show_file_locations() {
@@ -1839,7 +1841,7 @@ menu() {
     while :; do
         _menu_header
         _menu_options
-        local ans; ans=$(_read_text "$(t "Select" "请选择")" "")
+        local ans; ans=$(_read_text "$(t "  Select" "  请选择")" "")
         case "$ans" in
             1) do_status ;;
             2) svc_menu ;;
