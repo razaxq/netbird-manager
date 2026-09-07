@@ -30,7 +30,7 @@ NetBird ships an OpenWrt package, but only for **23.05 and newer**. Vendor firmw
 - **Mandatory integrity check** — the SHA-256 is fetched from the official GitHub release API and enforced; mirrors, proxies and a PAT are supported for speed, but a download mirror is never trusted as the source of the digest
 - **The setup key never touches disk** — it is passed via `--setup-key-file` from a 0600 file in a private temp dir that is wiped on exit, so it appears neither in `ps` output nor in any config file
 - **Transactional installs** — download and verify first, stage the binary and run its `version` before touching the live one, then commit with an atomic rename; `Ctrl+C` never leaves a half-written binary or a truncated service file
-- **OpenWrt integration** — optional one-command setup of dnsmasq forwarding for the NetBird DNS domain, the `netbird` firewall zone, and `lan ↔ netbird` forwarding, all idempotent and revertible
+- **Client and service management** — installation and updates manage NetBird and its service; login and connection are explicit actions, while router firewall, network and DNS settings remain user-managed
 - **Small-flash friendly** — free space is checked before installing; under procd the script keeps one backup and lets procd own the log stream instead of writing a rotating file into a tmpfs
 
 ---
@@ -50,7 +50,8 @@ Subcommands (run and exit; no argument opens the menu):
 sh netbird.sh status      # service + network status; exit 1 when not connected
 sh netbird.sh up          # connect        (netbird up)
 sh netbird.sh down        # disconnect     (netbird down)
-sh netbird.sh install     # install and connect
+sh netbird.sh install     # install client and service
+sh netbird.sh configure   # explicitly configure and connect
 sh netbird.sh update      # update the binary in place
 sh netbird.sh start       # start / stop / restart the service
 sh netbird.sh uninstall   # remove NetBird
@@ -74,21 +75,27 @@ The router needs roughly **60 MB of free flash** for the binary (`df -h /`) and 
 
 ### Copy-paste configuration
 
-Edit the values, then run the whole block. `sudo env` is used rather than `sudo VAR=…` because the default sudoers policy refuses variables set on the sudo command line.
+Install the client and service first:
+
+```sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/netbird-manager@main/netbird.sh -o netbird.sh
+sudo env NB_NONINTERACTIVE=1 sh netbird.sh install
+```
+
+After installation, run an explicit connection command when ready. Use `sudo env` to pass settings; `NB_VERSION` and `NB_GITHUB_MIRROR` can be set on the install command.
 
 **Join NetBird Cloud with a setup key**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/netbird-manager@main/netbird.sh -o netbird.sh
 sudo env \
   NB_NONINTERACTIVE=1 \
   NB_AUTH=key \
   NB_SETUP_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   NB_HOSTNAME=node-sg-01 \
-  sh netbird.sh
+  sh netbird.sh configure
 ```
 
-**Join a self-hosted management server, as a routing peer for the LAN**
+**Join a self-hosted management server**
 
 ```sh
 sudo env \
@@ -97,18 +104,10 @@ sudo env \
   NB_SETUP_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   NB_MANAGEMENT_URL=https://netbird.example.com:443 \
   NB_HOSTNAME=router-hq \
-  NB_OPENWRT_DNS=1 \
-  NB_OPENWRT_FIREWALL=1 \
-  sh netbird.sh
+  sh netbird.sh configure
 ```
 
-Optional additions to either block — a download mirror, a pinned version, and reading the key from a file instead:
-
-```sh
-NB_GITHUB_MIRROR=https://ghfast.top \
-NB_VERSION=v0.78.1 \
-NB_SETUP_KEY_FILE=/root/nb.key \
-```
+Use `NB_SETUP_KEY_FILE=/root/nb.key` instead of `NB_SETUP_KEY` to read the key from a file. Configure LAN forwarding, firewall and DNS yourself.
 
 ### Connection
 
@@ -131,7 +130,7 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `NB_DNS_RESOLVER_ADDRESS` | Bind address for NetBird's resolver (`ip:port`) | `127.0.0.1:5053` under procd, else the client default |
+| `NB_DNS_RESOLVER_ADDRESS` | Bind address for NetBird's resolver (`ip:port`) | client default (or an explicitly saved address) |
 | `NB_DISABLE_DNS` | `1` = do not manage DNS at all | `0` |
 | `NB_DISABLE_CLIENT_ROUTES` | `1` = do not accept routes from other peers | `0` |
 | `NB_DISABLE_SERVER_ROUTES` | `1` = do not act as a routing peer | `0` |
@@ -146,13 +145,13 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 | `NB_EXTERNAL_IP_MAP` | Advertise a fixed external IP (NAT hairpin) | empty |
 | `NB_NETWORK_MONITOR` | `1`/`0` = restart the connection on network changes | client default |
 
-### OpenWrt integration
+### OpenWrt configuration scope
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `NB_OPENWRT_DNS` | `1` = add the dnsmasq forwarding entry for the NetBird domain | `0` |
-| `NB_OPENWRT_FIREWALL` | `1` = create the `netbird` interface, zone and `lan ↔ netbird` forwarding | `0` |
-| `NB_DNS_DOMAIN` | Domain to forward | `netbird.cloud`, or `netbird.selfhosted` when self-hosting |
+Installation and updates do not log in or run `netbird up`. Connect explicitly with menu 4 (Configure and connect), menu 5 (Connect using saved settings), or the `configure` / `up` subcommands. An existing peer may resume its connection when the NetBird service restarts.
+
+The script does not modify UCI network, firewall, forwarding or dnsmasq settings, or reload those router services. Upgrades and uninstall also leave entries created by older script versions untouched; manage them yourself. The old `NB_OPENWRT_DNS`, `NB_OPENWRT_FIREWALL` and `NB_DNS_DOMAIN` variables have been removed and no longer enable integration.
+
+The routing, DNS and security options above control the NetBird client itself when connecting; they do not create OpenWrt configuration.
 
 ### Version and download
 
@@ -213,7 +212,7 @@ sh tests/test_upstream_compat.sh   # needs network; downloads one real release a
 
 CI runs ShellCheck and the unit tests under `sh`, `dash` and `busybox sh`; a weekly job verifies the upstream release matrix, the published digests and the archive layout.
 
-Updates restore the saved daemon configuration, socket and log settings; explicit environment values override them. Boolean connection settings are saved as explicit `true`/`false` options so reconfiguration can turn features off as well as on. Service operations return failure if the service command fails or the daemon does not become ready. OpenWrt firewall setup reloads the network configuration before applying the zone.
+Updates restore the saved daemon configuration, socket and log settings; explicit environment values override them. Boolean connection settings are saved as explicit `true`/`false` options so reconfiguration can turn features off as well as on. Service operations return failure if the service command fails or the daemon does not become ready. Install and manual connection flows are tested separately to ensure router configuration and services are not called.
 
 On Git for Windows, the tests explicitly skip Unix file-mode assertions; Linux CI still enforces them. For a downloaded official client, set `NB_TEST_REAL_BIN=/path/to/netbird` when running `test_regressions.sh` to also check key-file argument compatibility without connecting or installing a service.
 
@@ -231,13 +230,13 @@ On Git for Windows, the tests explicitly skip Unix file-mode assertions; Linux C
 
 **Q: Is the setup key stored anywhere?** No. It is written to a 0600 file in a private temp directory, passed to the client as `--setup-key-file` so it never appears in `ps`, and the file is truncated and deleted when the script exits. `up.args` holds the other options; NetBird keeps the resulting peer identity in its own state directory.
 
-**Q: DNS stops working on my router after connecting.** dnsmasq already owns port 53, so under procd the script pins NetBird's resolver to `127.0.0.1:5053` and offers to add the matching dnsmasq forwarding entry. If you skipped that step, run the script again and pick **OpenWrt integration → DNS**, or set `NB_DISABLE_DNS=1` to leave DNS alone entirely.
+**Q: DNS stops working on my router after connecting.** Check the client and router DNS settings yourself. The script no longer pins the resolver port or modifies dnsmasq. Set `NB_DNS_RESOLVER_ADDRESS` during explicit configuration if you need a specific address, or use `NB_DISABLE_DNS=1` to disable the client's DNS management.
 
-**Q: Can I configure `wt0` in LuCI?** No. NetBird creates and fully manages that interface and its keys. The script's firewall integration adds `wt0` to the network config as `proto none` precisely so the firewall can reference it without anyone trying to configure it.
+**Q: Can I configure `wt0` in LuCI?** NetBird creates and manages the tunnel interface and keys. Configure any required interface association, firewall zone and forwarding rules yourself in LuCI or OpenWrt; the script no longer creates them.
 
 **Q: Does a firmware upgrade keep NetBird?** A sysupgrade wipes `/usr/bin`, so the binary is gone and has to be reinstalled — run the script again. Configuration under `/etc/netbird` survives if it is in your sysupgrade backup list; the peer identity in `/var/lib/netbird` usually does not, so plan on re-authenticating.
 
-**Q: Does uninstalling delete my config and node identity?** Not automatically. The uninstall flow asks **separately** about the backups, `/etc/netbird`, `/var/lib/netbird` and the OpenWrt network/firewall/DNS entries, and keeps everything by default. Removing the peer from the NetBird dashboard is a separate step.
+**Q: Does uninstalling delete my config and node identity?** Uninstall asks separately about binary backups, `/etc/netbird` and `/var/lib/netbird`; backups default to deletion, configuration and identity to retention. Router network, firewall and DNS settings remain user-managed, including entries added by older script versions. Removing the peer from the NetBird dashboard is a separate step.
 
 ---
 

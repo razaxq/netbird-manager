@@ -25,7 +25,9 @@
 #    amd64 / arm64 / armv6 / 386 / mips / mipsle / mips64 / mips64le
 #    (MIPS float ABI is auto-detected; soft-float is the safe default)
 # ------------------------------------------------------------------------------
-#  Non-interactive install (preset all params via env vars):
+#  Non-interactive install: NB_NONINTERACTIVE=1 sh netbird.sh install
+#  Configure/connect explicitly: NB_NONINTERACTIVE=1 NB_SETUP_KEY=<key> sh netbird.sh configure
+#  Connection settings below apply to configure/up, not installation:
 #    NB_NONINTERACTIVE=1         — skip all prompts, use defaults or the vars below
 #    NB_LANG=en|zh               — force interface language
 #    NB_VERSION=v0.78.1          — version to install
@@ -39,7 +41,7 @@
 #    NB_INTERFACE_NAME=wt0       — WireGuard interface name
 #    NB_WIREGUARD_PORT=51820     — WireGuard listen port
 #    NB_MTU=1280                 — interface MTU
-#    NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5053  — NetBird resolver bind (procd default; 53 is dnsmasq's)
+#    NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5053  — NetBird resolver bind (optional; client default otherwise)
 #    NB_DISABLE_DNS=1            — do not manage DNS at all
 #    NB_DISABLE_CLIENT_ROUTES=1  — do not accept routes from other peers
 #    NB_DISABLE_SERVER_ROUTES=1  — do not act as a routing peer
@@ -61,9 +63,6 @@
 #                                  /etc/netbird/config.json. Only set this if you must.
 #    NB_DAEMON_ADDR=unix:///var/run/netbird.sock
 #    NB_BIN_DIR=/usr/bin         — where the binary is installed
-#    NB_OPENWRT_DNS=1            — OpenWrt: forward the NetBird DNS domain to it through dnsmasq
-#    NB_OPENWRT_FIREWALL=1       — OpenWrt: create the netbird zone + lan<->netbird forwarding
-#    NB_DNS_DOMAIN=netbird.cloud — the DNS domain to forward (netbird.selfhosted when self-hosting)
 #    NB_ARCH=arm64               — override auto-detected release architecture
 #    NB_ALLOW_PRERELEASE=1       — allow auto-selection of a pre-release
 #    NB_ALLOW_VERSION_FALLBACK=1 — allow NB_DEFAULT_VERSION when the release API fails
@@ -82,7 +81,7 @@
 #      log target are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 # ── Tunables ──────────────────────────────────────────
 # Sentinels record whether the user set the var explicitly; after detect_system, procd applies
@@ -180,11 +179,6 @@ NB_EXTRA_DNS_LABELS="${NB_EXTRA_DNS_LABELS:-}"
 NB_EXTRA_IFACE_BLACKLIST="${NB_EXTRA_IFACE_BLACKLIST:-}"
 NB_EXTERNAL_IP_MAP="${NB_EXTERNAL_IP_MAP:-}"
 NB_NETWORK_MONITOR="${NB_NETWORK_MONITOR:-}"   # empty = client default
-
-# OpenWrt integration (opt-in; the wizard offers them interactively)
-NB_OPENWRT_DNS="${NB_OPENWRT_DNS:-0}"
-NB_OPENWRT_FIREWALL="${NB_OPENWRT_FIREWALL:-0}"
-NB_DNS_DOMAIN="${NB_DNS_DOMAIN:-}"       # empty → derived from NB_MANAGEMENT_URL
 
 # Space requirements: tarball ~20MB, extracted binary ~50MB
 NB_MIN_TMP_MB="${NB_MIN_TMP_MB:-110}"
@@ -1152,10 +1146,7 @@ do_install_bin() {
 # ==============================================================================
 #  Saved settings
 # ==============================================================================
-# Re-read what a previous run configured. Without this, every menu action taken in a *later* run
-# — set up the firewall, add the DNS forwarding, revert on uninstall — would operate on this
-# run's defaults (wt0, cloud, no resolver) instead of on what is actually deployed: the firewall
-# zone would bind the wrong interface and the dnsmasq entry would forward the wrong domain.
+# Restore deployed daemon and connection settings for later updates or manual connections.
 # Values given explicitly through the environment still win.
 _load_saved_daemon_args() {
     [ -r "$NB_DAEMON_ARGS_FILE" ] || return 0
@@ -1224,11 +1215,6 @@ load_saved_args() {
 # ==============================================================================
 #  `netbird up` argument wizard
 # ==============================================================================
-_derive_dns_domain() {
-    [ -n "$NB_DNS_DOMAIN" ] && { printf '%s' "$NB_DNS_DOMAIN"; return; }
-    if [ -n "$NB_MANAGEMENT_URL" ]; then printf 'netbird.selfhosted'; else printf 'netbird.cloud'; fi
-}
-
 _up_wizard() {
     section "$(t "Connection settings" "连接设置")"
 
@@ -1299,13 +1285,6 @@ _up_wizard() {
                 NB_ENABLE_ROSENPASS=1
             else NB_ENABLE_ROSENPASS=0; fi
         fi
-    fi
-
-    # OpenWrt: dnsmasq already owns :53, so pin NetBird's resolver to an alternative port unless
-    # DNS management is off or the user pinned an address explicitly.
-    if [ "$INIT_SYS" = "procd" ] && ! _bool_value "$NB_DISABLE_DNS" && \
-       [ -z "$NB_DNS_RESOLVER_ADDRESS" ] && [ -z "$_u_resolver" ]; then
-        NB_DNS_RESOLVER_ADDRESS="127.0.0.1:5053"
     fi
 
     # Resolve the auth mode when it was not stated. A key supplied by env means "key"; with no key
@@ -1447,184 +1426,6 @@ do_disconnect() {
 }
 
 # ==============================================================================
-#  OpenWrt integration — DNS forwarding, firewall zone, network interface
-# ==============================================================================
-# These scan `uci show` rather than walking indices with `uci get`. Walking stops at the first
-# section that happens to lack the option being probed — a single unnamed zone would hide every
-# zone after it — whereas the dump lists them all.
-_uci_zone_index() {
-    local idx
-    idx=$(uci -q show firewall 2>/dev/null \
-          | sed -n "s/^firewall\.@zone\[\([0-9][0-9]*\)\]\.name='netbird'\$/\1/p" | head -1)
-    [ -n "$idx" ] || return 1
-    printf '%s' "$idx"
-}
-
-_uci_forwarding_exists() {
-    local src="$1" dst="$2" i
-    for i in $(uci -q show firewall 2>/dev/null \
-               | sed -n "s/^firewall\.@forwarding\[\([0-9][0-9]*\)\]\.src='${src}'\$/\1/p"); do
-        [ "$(uci -q get "firewall.@forwarding[$i].dest" 2>/dev/null)" = "$dst" ] && return 0
-    done
-    return 1
-}
-
-# First forwarding index that mentions the netbird zone on either side (for revert).
-_uci_forwarding_netbird_index() {
-    local idx
-    idx=$(uci -q show firewall 2>/dev/null \
-          | sed -n "s/^firewall\.@forwarding\[\([0-9][0-9]*\)\]\.\(src\|dest\)='netbird'\$/\1/p" | head -1)
-    [ -n "$idx" ] || return 1
-    printf '%s' "$idx"
-}
-
-openwrt_dns_setup() {
-    command -v uci > /dev/null 2>&1 || { msg_err "$(t "uci not found" "未找到 uci")"; return 1; }
-    # Forwarding only works against a pinned port. With no --dns-resolver-address the client
-    # picks a free port by itself and any entry written here would point at the wrong one.
-    if [ -z "$NB_DNS_RESOLVER_ADDRESS" ]; then
-        msg_warn "$(t "NetBird's resolver address is not pinned, so a forwarding entry would go stale." \
-                      "NetBird 解析器地址未固定，写入的转发条目会失效。")"
-        msg_info "$(t "Run \"Configure and connect\" first, or set NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5053." \
-                      "请先执行\"配置并连接\"，或设置 NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5053。")"
-        return 1
-    fi
-
-    local domain addr port entry
-    domain=$(_derive_dns_domain)
-    addr=${NB_DNS_RESOLVER_ADDRESS%:*}
-    port=${NB_DNS_RESOLVER_ADDRESS##*:}
-    entry="/${domain}/${addr}#${port}"
-
-    if uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr ' ' '\n' | grep -qx -- "$entry"; then
-        msg_info "$(printf "$(t "dnsmasq already forwards %s" "dnsmasq 已转发 %s")" "$domain")"
-        return 0
-    fi
-    uci add_list "dhcp.@dnsmasq[0].server=${entry}" || return 1
-    uci commit dhcp || return 1
-    "${NB_INITD_DIR}/dnsmasq" restart || return 1
-    msg_ok "$(printf "$(t "dnsmasq now forwards %s to %s" "dnsmasq 已将 %s 转发到 %s")" "$domain" "$NB_DNS_RESOLVER_ADDRESS")"
-    return 0
-}
-
-_openwrt_reload_network() {
-    "${NB_INITD_DIR}/network" reload || return 1
-    # netifd must know the logical interface before fw3/fw4 resolves zone networks.
-    if [ "${1:-}" = netbird ]; then
-        ubus -S call network.interface.netbird status > /dev/null || return 1
-    fi
-}
-
-openwrt_firewall_setup() {
-    command -v uci > /dev/null 2>&1 || { msg_err "$(t "uci not found" "未找到 uci")"; return 1; }
-    local iface="${NB_INTERFACE_NAME:-wt0}"
-
-    # network interface — proto none, NetBird owns the device
-    if [ "$(uci -q get network.netbird 2>/dev/null)" != "interface" ]; then
-        uci set network.netbird=interface || return 1
-        uci set network.netbird.proto='none' || return 1
-        uci set network.netbird.device="$iface" || return 1
-        uci commit network || return 1
-        msg_ok "$(printf "$(t "Network interface 'netbird' bound to %s" "网络接口 netbird 已绑定 %s")" "$iface")"
-    else
-        uci set network.netbird.device="$iface" || return 1
-        uci commit network || return 1
-        msg_info "$(t "Network interface 'netbird' already present" "网络接口 netbird 已存在")"
-    fi
-    _openwrt_reload_network netbird || return 1
-
-    if _uci_zone_index > /dev/null; then
-        msg_info "$(t "Firewall zone 'netbird' already present" "防火墙区域 netbird 已存在")"
-    else
-        uci add firewall zone > /dev/null || return 1
-        uci set firewall.@zone[-1].name='netbird' || return 1
-        uci set firewall.@zone[-1].input='ACCEPT' || return 1
-        uci set firewall.@zone[-1].output='ACCEPT' || return 1
-        uci set firewall.@zone[-1].forward='ACCEPT' || return 1
-        uci set firewall.@zone[-1].masq='1' || return 1
-        uci add_list firewall.@zone[-1].network='netbird' || return 1
-        msg_ok "$(t "Firewall zone 'netbird' created" "已创建防火墙区域 netbird")"
-        msg_warn "$(t "The zone accepts all traffic on the tunnel; NetBird access policies are what restrict it." \
-                      "该区域放行隧道上的全部流量，实际限制由 NetBird 的访问策略决定。")"
-    fi
-
-    if _ask_flag "$(t "Allow LAN → NetBird (local devices reach the mesh)?" \
-                      "允许 LAN → NetBird（本地设备访问网络）？")" y; then
-        _uci_forwarding_exists lan netbird || {
-            uci add firewall forwarding > /dev/null || return 1
-            uci set firewall.@forwarding[-1].src='lan' || return 1
-            uci set firewall.@forwarding[-1].dest='netbird' || return 1
-        }
-    fi
-    if _ask_flag "$(t "Allow NetBird → LAN (peers reach your local network)?" \
-                      "允许 NetBird → LAN（远端节点访问本地网络）？")" y; then
-        _uci_forwarding_exists netbird lan || {
-            uci add firewall forwarding > /dev/null || return 1
-            uci set firewall.@forwarding[-1].src='netbird' || return 1
-            uci set firewall.@forwarding[-1].dest='lan' || return 1
-        }
-    fi
-    uci commit firewall || return 1
-    "${NB_INITD_DIR}/firewall" restart || return 1
-    msg_ok "$(t "Firewall updated" "防火墙已更新")"
-    msg_info "$(t "Finally, add this router's LAN subnet as a network resource in the dashboard." \
-                  "最后请在控制台把本路由器的局域网网段添加为网络资源。")"
-    return 0
-}
-
-openwrt_revert() {
-    command -v uci > /dev/null 2>&1 || return 0
-    local i domain e
-    domain=$(_derive_dns_domain)
-    if uci -q get network.netbird > /dev/null 2>&1; then
-        uci -q delete network.netbird || return 1
-        uci commit network || return 1
-        _openwrt_reload_network || return 1
-    fi
-    while i=$(_uci_zone_index); do
-        uci -q delete "firewall.@zone[$i]" || return 1
-    done
-    # deleting a section renumbers the ones after it, so always re-find the first match
-    while i=$(_uci_forwarding_netbird_index); do
-        uci -q delete "firewall.@forwarding[$i]" || return 1
-    done
-    uci commit firewall || return 1
-    # Match the entry by domain, not by rebuilding the string from NB_DNS_RESOLVER_ADDRESS: on an
-    # uninstall run that variable may be empty or hold a different port than the one installed.
-    for e in $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null); do
-        case "$e" in
-            "/${domain}/"*) uci -q del_list "dhcp.@dnsmasq[0].server=${e}" || return 1 ;;
-        esac
-    done
-    uci commit dhcp || return 1
-    "${NB_INITD_DIR}/firewall" restart || return 1
-    "${NB_INITD_DIR}/dnsmasq" restart || return 1
-    msg_ok "$(t "OpenWrt network/firewall/DNS entries reverted" "OpenWrt 网络/防火墙/DNS 配置已还原")"
-}
-
-openwrt_menu() {
-    [ "$INIT_SYS" = "procd" ] || {
-        msg_warn "$(t "Router integration is OpenWrt-only" "路由器集成仅适用于 OpenWrt")"; return 0; }
-    section "$(t "OpenWrt integration" "OpenWrt 集成")"
-    printf '%s\n' "$(t "  1) DNS — forward the NetBird domain through dnsmasq" \
-                      "  1) DNS —— 通过 dnsmasq 转发 NetBird 域名")"
-    printf '%s\n' "$(t "  2) Firewall — create the netbird zone and forwardings" \
-                      "  2) 防火墙 —— 创建 netbird 区域与转发规则")"
-    printf '%s\n' "$(t "  3) Both" "  3) 两者都做")"
-    printf '%s\n' "$(t "  4) Revert everything this script added" "  4) 还原本脚本添加的全部配置")"
-    printf '%s\n' "$(t "  0) Back" "  0) 返回")"
-    printf '\n'
-    local ans; ans=$(_read_text "$(t "Choice" "请选择")" "0")
-    case "$ans" in
-        1) openwrt_dns_setup ;;
-        2) openwrt_firewall_setup ;;
-        3) openwrt_dns_setup && openwrt_firewall_setup ;;
-        4) _ask_flag "$(t "Really revert?" "确认还原？")" n && openwrt_revert ;;
-        *) return 0 ;;
-    esac
-}
-
-# ==============================================================================
 #  Status
 # ==============================================================================
 do_status() {
@@ -1683,16 +1484,12 @@ do_uninstall() {
     if _ask_flag "$(printf "$(t "Delete the client state in %s?" "删除 %s 中的运行状态？")" "$NB_STATE_DIR")" n; then
         rm -rf "$NB_STATE_DIR" 2>/dev/null || true
     fi
-    if [ "$INIT_SYS" = "procd" ] && _ask_flag "$(t "Revert the OpenWrt network/firewall/DNS entries?" \
-                                                   "还原 OpenWrt 网络/防火墙/DNS 配置？")" n; then
-        openwrt_revert || return 1
-    fi
     msg_ok "$(t "Done" "完成")"
     return 0
 }
 
 # ==============================================================================
-#  Install flow (menu item 1) — download → service → connect
+#  Install flow (menu item 6) — download → service; connection is a separate action
 # ==============================================================================
 do_install() {
     check_deps || return 1
@@ -1710,31 +1507,11 @@ do_install() {
     write_daemon_args || return 1
     svc_write         || return 1
 
-    _up_wizard      || return 1
-    write_up_args   || return 1
-
     svc_start || return 1
-    do_connect || return 1
 
-    if [ "$INIT_SYS" = "procd" ]; then
-        if [ "${NB_NONINTERACTIVE:-0}" = "1" ]; then
-            if _bool_value "$NB_OPENWRT_DNS"; then openwrt_dns_setup || return 1; fi
-            if _bool_value "$NB_OPENWRT_FIREWALL"; then openwrt_firewall_setup || return 1; fi
-        else
-            printf '\n'
-            if _ask_flag "$(t "Set up dnsmasq forwarding for NetBird DNS?" "是否配置 dnsmasq 转发 NetBird DNS？")" y; then
-                openwrt_dns_setup || return 1
-            fi
-            if _ask_flag "$(t "Set up the firewall so your LAN can use the mesh?" \
-                              "是否配置防火墙，使局域网可以使用该网络？")" y; then
-                openwrt_firewall_setup || return 1
-            fi
-        fi
-    fi
-
-    printf '\n'
-    if [ "$NB_AUTH" != none ]; then do_status > /dev/null 2>&1 || return 1; fi
     msg_ok "$(t "Installation finished" "安装完成")"
+    msg_info "$(t "Use Configure and connect (menu 4) when you are ready to sign in." \
+                  "需要登录时，请选择菜单 4：配置并连接。")"
     return 0
 }
 
@@ -1815,7 +1592,7 @@ _menu_options() {
     _menu_item 3 "$(t "Disconnect (netbird down)" "断开连接 (netbird down)")"
     _menu_group "$(t "Configuration" "配置")"
     _menu_item 4 "$(t "Configure and connect" "配置并连接")"
-    _menu_item 5 "$(t "OpenWrt integration (DNS / firewall)" "OpenWrt 集成（DNS / 防火墙）")"
+    _menu_item 5 "$(t "Connect (saved settings)" "连接（使用已保存设置）")"
     _menu_group "$(t "Maintenance" "维护")"
     _menu_item 6 "$(t "Install / update (choose version)" "安装 / 更新（选择版本）")"
     _menu_item 7 "$(t "File locations & logs" "文件位置与日志")"
@@ -1847,7 +1624,7 @@ menu() {
             2) svc_menu ;;
             3) do_disconnect ;;
             4) do_reconfigure ;;
-            5) openwrt_menu ;;
+            5) (NB_AUTH=sso; do_connect) ;;
             6) if [ -x "$NB_BIN" ]; then do_update; else do_install; fi ;;
             7) _show_file_locations ;;
             8) do_uninstall ;;
@@ -1885,8 +1662,9 @@ show_help() {
     printf "${C_BLD}  NetBird Manager v%s${C_RST}\n\n" "$SCRIPT_VERSION"
     printf '%s\n\n' "$(t "  Usage: sh netbird.sh [subcommand]" "  用法: sh netbird.sh [子命令]")"
     printf '%s\n' "$(t "    (no argument)  open the interactive menu" "    (无参数)       打开交互菜单")"
-    printf '%s\n' "$(t "    install        install and connect"       "    install        安装并连接")"
+    printf '%s\n' "$(t "    install        install client and service" "    install        安装客户端与服务")"
     printf '%s\n' "$(t "    update         update the binary"         "    update         更新二进制")"
+    printf '%s\n' "$(t "    configure      configure and connect"     "    configure      配置并连接")"
     printf '%s\n' "$(t "    up             connect (netbird up)"      "    up             连接 (netbird up)")"
     printf '%s\n' "$(t "    down           disconnect"                "    down           断开连接")"
     printf '%s\n' "$(t "    status         service + network status"  "    status         服务与网络状态")"
@@ -1911,7 +1689,7 @@ _require_interactive() {
     msg_info "$(t "Piping the script into a shell makes every prompt read the script itself." \
                   "把脚本通过管道喂给 shell，会让每个提示读到脚本自身的内容。")"
     _cmd_hint "curl -fsSL <url> -o netbird.sh && sh netbird.sh" "$(t "download first, then run" "先下载再运行")"
-    _cmd_hint "NB_NONINTERACTIVE=1 NB_SETUP_KEY=… sh netbird.sh" "$(t "or drive it with variables" "或用变量驱动")"
+    _cmd_hint "NB_NONINTERACTIVE=1 sh netbird.sh install" "$(t "or drive it with variables" "或用变量驱动")"
     exit 2
 }
 
@@ -1948,12 +1726,13 @@ main() {
     _log "INFO" "start v${SCRIPT_VERSION} arg=${1:-menu}"
 
     case "${1:-}" in
-        ''|install|update|uninstall) _require_interactive ;;
+        ''|install|update|configure|uninstall) _require_interactive ;;
     esac
 
     case "${1:-}" in
         install)   do_install ;;
         update)    do_update ;;
+        configure) do_reconfigure ;;
         up)        do_connect ;;
         down)      do_disconnect ;;
         status)    do_status ;;
@@ -1962,7 +1741,7 @@ main() {
         restart)   svc_restart && msg_ok "$(t "Restarted" "已重启")" ;;
         uninstall) do_uninstall ;;
         '')        if [ "${NB_NONINTERACTIVE:-0}" = "1" ]; then
-                       if [ -x "$NB_BIN" ]; then do_update && do_reconfigure; else do_install; fi
+                       if [ -x "$NB_BIN" ]; then do_update; else do_install; fi
                    else
                        menu
                    fi ;;

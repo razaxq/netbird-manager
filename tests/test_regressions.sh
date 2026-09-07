@@ -262,56 +262,101 @@ update_socket_order() (
 )
 check 'updating a running client applies the new socket before restarting' update_socket_order
 
-# Real executable service doubles avoid any writes or restarts in /etc/init.d.
+# Catch router configuration/service access, including legacy opt-in variables.
 for service in network firewall dnsmasq; do
     cat > "$NB_INITD_DIR/$service" <<'SERVICE'
 #!/bin/sh
-name=${0##*/}
-printf '%s %s\n' "$name" "$*" >> "$TEST_EVENTS"
-[ "${TEST_FAIL_SERVICE:-}" != "$name" ]
+printf '%s %s\n' "${0##*/}" "$*" >> "$TEST_EVENTS"
+exit 42
 SERVICE
     chmod +x "$NB_INITD_DIR/$service"
 done
-TEST_EVENTS="$T/events"; export TEST_EVENTS
+TEST_EVENTS="$T/router-events"; export TEST_EVENTS
 
-router_flow() (
-    INIT_SYS=procd
-    uci() {
-        printf 'uci %s\n' "$*" >> "$TEST_EVENTS"
-        case "$*" in '-q get network.netbird') return 1 ;; esac
-        return 0
+program_only() (
+    INIT_SYS=procd; NB_OPENWRT_DNS=1; NB_OPENWRT_FIREWALL=1
+    NB_STATE_DIR="$T/state"
+    uci() { printf 'uci\n' >> "$TEST_EVENTS"; return 42; }
+    ubus() { printf 'ubus\n' >> "$TEST_EVENTS"; return 42; }
+    check_deps() { :; }; select_version() { :; }; do_download() { :; }
+    do_install_bin() { :; }; svc_foreign() { return 1; }
+    svc_start() { :; }; svc_restart() { :; }; svc_stop() { :; }; svc_remove() { :; }
+    _daemon_running() { return 1; }
+    _up_wizard() { printf 'wizard\n' >> "$TEST_EVENTS"; return 42; }
+    do_connect() { printf 'connect\n' >> "$TEST_EVENTS"; return 42; }
+    _ask_flag() {
+        case "$1" in
+            *dnsmasq*|*firewall*|*forwarding*|*OpenWrt*) printf 'router prompt\n' >> "$TEST_EVENTS" ;;
+            'Remove the NetBird client'*) return 0 ;;
+        esac
+        return 1
     }
-    ubus() {
-        printf 'ubus %s\n' "$*" >> "$TEST_EVENTS"
-        [ "${TEST_FAIL_UBUS:-0}" = 0 ]
-    }
-    _uci_zone_index() { return 0; }; _uci_forwarding_exists() { return 0; }
+    NB_LANG=en
     : > "$TEST_EVENTS"
-    openwrt_firewall_setup >/dev/null || exit 1
-    actual=$(grep -E 'uci commit network|network reload|ubus |firewall restart' "$TEST_EVENTS")
-    [ "$actual" = "$(printf 'uci commit network\nnetwork reload\nubus -S call network.interface.netbird status\nfirewall restart')" ] || exit 1
-    TEST_FAIL_SERVICE=network; export TEST_FAIL_SERVICE
-    : > "$TEST_EVENTS"
-    ! openwrt_firewall_setup >/dev/null 2>&1 || exit 1
-    ! grep -q 'firewall restart' "$TEST_EVENTS" || exit 1
-    TEST_FAIL_SERVICE=''; TEST_FAIL_UBUS=1
-    : > "$TEST_EVENTS"
-    ! openwrt_firewall_setup >/dev/null 2>&1 || exit 1
-    ! grep -q 'firewall restart' "$TEST_EVENTS" || exit 1
-    TEST_FAIL_UBUS=0; TEST_FAIL_SERVICE=firewall
-    ! openwrt_firewall_setup >/dev/null 2>&1
+    # A fresh install must not create connection settings or require authentication.
+    rm -f "$NB_UP_ARGS_FILE"
+    NB_AUTH=key; NB_SETUP_KEY=''
+    do_install >/dev/null || exit 1
+    [ ! -e "$NB_UP_ARGS_FILE" ] || exit 1
+    printf '%s\n' --interface-name nb-custom > "$NB_UP_ARGS_FILE"
+    cp "$NB_UP_ARGS_FILE" "$T/up-before"
+    for mode in 0 1; do
+        NB_NONINTERACTIVE=$mode
+        do_install >/dev/null || exit 1
+        do_update >/dev/null || exit 1
+        cmp "$T/up-before" "$NB_UP_ARGS_FILE" || exit 1
+    done
+    # Use a disposable copy so uninstall never removes the shared client double.
+    NB_BIN="$T/uninstall-client"; cp "$NB_BIN_DIR/netbird" "$NB_BIN"
+    do_uninstall >/dev/null || exit 1
+    [ ! -e "$NB_BIN" ] || exit 1
+    cmp "$T/up-before" "$NB_UP_ARGS_FILE" && [ ! -s "$TEST_EVENTS" ]
 )
-check 'OpenWrt loads and checks the network before firewall application, propagating failures' router_flow
+check 'install/update/uninstall leave router settings alone and never prompt for a connection' program_only
 
-router_revert() (
-    uci() { printf 'uci %s\n' "$*" >> "$TEST_EVENTS"; }
-    _uci_zone_index() { return 1; }; _uci_forwarding_netbird_index() { return 1; }
-    : > "$TEST_EVENTS"
-    openwrt_revert >/dev/null || exit 1
-    actual=$(grep -E 'uci commit network|network reload|firewall restart' "$TEST_EVENTS")
-    [ "$actual" = "$(printf 'uci commit network\nnetwork reload\nfirewall restart')" ]
+noninteractive_entry() (
+    NB_NONINTERACTIVE=1
+    detect_system() { INIT_SYS=procd; }
+    id() { printf '0\n'; }
+    do_install() { printf 'install\n' >> "$T/entry-events"; }
+    do_update() { printf 'update\n' >> "$T/entry-events"; }
+    do_reconfigure() { printf 'configure\n' >> "$T/entry-events"; }
+    do_connect() { printf 'connect\n' >> "$T/entry-events"; }
+    : > "$T/entry-events"
+    main || exit 1
+    NB_BIN="$T/not-installed"
+    main || exit 1
+    main configure || exit 1
+    main up || exit 1
+    [ "$(cat "$T/entry-events")" = "$(printf 'update\ninstall\nconfigure\nconnect')" ]
 )
-check 'OpenWrt revert also reloads the removed logical interface' router_revert
+check 'noninteractive default only installs/updates; configure/up remain explicit actions' noninteractive_entry
+
+manual_configuration() (
+    INIT_SYS=procd; NB_NONINTERACTIVE=1; NB_AUTH=none
+    NB_DNS_RESOLVER_ADDRESS=''; _u_resolver=''
+    svc_restart() { :; }
+    do_reconfigure >/dev/null || exit 1
+    [ -f "$NB_UP_ARGS_FILE" ] || exit 1
+    [ -z "$NB_DNS_RESOLVER_ADDRESS" ] || exit 1
+    ! grep -qF -- --dns-resolver-address "$NB_UP_ARGS_FILE" || exit 1
+    NB_DNS_RESOLVER_ADDRESS=127.0.0.1:5353
+    do_reconfigure >/dev/null || exit 1
+    grep -qxF 127.0.0.1:5353 "$NB_UP_ARGS_FILE"
+)
+check 'manual configure remains available and only pins DNS when explicitly requested' manual_configuration
+
+manual_menu() (
+    NB_AUTH=none; NB_NONINTERACTIVE=0
+    _menu_header() { :; }; _menu_options() { :; }
+    do_reconfigure() { printf 'configure\n' >> "$T/menu-events"; }
+    do_connect() { [ "$NB_AUTH" != none ] && printf 'connect\n' >> "$T/menu-events"; }
+    : > "$T/menu-events"
+    printf '4\n\n5\n\n9\n' > "$T/menu-input"
+    (menu < "$T/menu-input" >/dev/null 2>&1) || exit 1
+    [ "$(cat "$T/menu-events")" = "$(printf 'configure\nconnect')" ]
+)
+check 'menu keeps explicit configure and saved-connection actions, including after configure-only' manual_menu
 
 printf '\n  %s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]

@@ -30,7 +30,7 @@ NetBird 官方提供 OpenWrt 软件包，但只覆盖 **23.05 及以上**。基�
 - **强制完整性校验** —— SHA-256 从 GitHub 官方 Release API 获取并强制比对；支持镜像、代理与 PAT 加速下载，但下载镜像永远不会被当作摘要来源
 - **Setup Key 不落盘** —— 通过 `--setup-key-file` 从私有临时目录中的 0600 文件传入，退出时清除，因此既不会出现在 `ps` 输出里，也不会写进任何配置文件
 - **事务式安装** —— 先下载校验，暂存后运行 `version` 确认可执行，再用原子重命名提交；`Ctrl+C` 不会留下写了一半的二进制或被截断的服务文件
-- **OpenWrt 集成** —— 可一键配置 dnsmasq 对 NetBird DNS 域名的转发、`netbird` 防火墙区域以及 `lan ↔ netbird` 转发，全部幂等且可还原
+- **程序与服务管理** —— 安装和更新仅管理 NetBird 客户端及其服务；登录和连接由用户手动发起，路由器防火墙、网络和 DNS 由用户自行配置
 - **对小闪存友好** —— 安装前检查可用空间；procd 下自动只保留一份备份，并把日志交给 procd，而不是往 tmpfs 里写滚动日志文件
 
 ---
@@ -50,7 +50,8 @@ sudo sh netbird.sh
 sh netbird.sh status      # 服务与网络状态；未连接时退出码为 1
 sh netbird.sh up          # 连接        (netbird up)
 sh netbird.sh down        # 断开        (netbird down)
-sh netbird.sh install     # 安装并连接
+sh netbird.sh install     # 安装客户端与服务
+sh netbird.sh configure   # 手动配置并连接
 sh netbird.sh update      # 原地更新二进制
 sh netbird.sh start       # 启动 / 停止 / 重启服务
 sh netbird.sh uninstall   # 卸载 NetBird
@@ -74,21 +75,27 @@ sh /tmp/netbird.sh
 
 ### 可直接复制的配置
 
-改好数值后整段执行。这里用 `sudo env` 而不是 `sudo VAR=…`，是因为默认的 sudoers 策略会拒绝在 sudo 命令行上设置的变量。
+先安装程序和服务：
+
+```sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/netbird-manager@main/netbird.sh -o netbird.sh
+sudo env NB_NONINTERACTIVE=1 sh netbird.sh install
+```
+
+安装完成后，需要登录时再执行以下命令。使用 `sudo env` 传入参数；安装时可设置 `NB_VERSION` 和 `NB_GITHUB_MIRROR`。
 
 **用 Setup Key 加入 NetBird 云服务**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/netbird-manager@main/netbird.sh -o netbird.sh
 sudo env \
   NB_NONINTERACTIVE=1 \
   NB_AUTH=key \
   NB_SETUP_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   NB_HOSTNAME=node-sg-01 \
-  sh netbird.sh
+  sh netbird.sh configure
 ```
 
-**加入自建管理端，并作为局域网的路由节点**
+**加入自建管理端**
 
 ```sh
 sudo env \
@@ -97,18 +104,10 @@ sudo env \
   NB_SETUP_KEY=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   NB_MANAGEMENT_URL=https://netbird.example.com:443 \
   NB_HOSTNAME=router-hq \
-  NB_OPENWRT_DNS=1 \
-  NB_OPENWRT_FIREWALL=1 \
-  sh netbird.sh
+  sh netbird.sh configure
 ```
 
-两段都可以追加的可选项 —— 下载镜像、固定版本，以及改为从文件读取 Key：
-
-```sh
-NB_GITHUB_MIRROR=https://ghfast.top \
-NB_VERSION=v0.78.1 \
-NB_SETUP_KEY_FILE=/root/nb.key \
-```
+也可用 `NB_SETUP_KEY_FILE=/root/nb.key` 替代 `NB_SETUP_KEY`，从文件读取密钥。局域网转发、防火墙与 DNS 请自行配置。
 
 ### 连接配置
 
@@ -131,7 +130,7 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
-| `NB_DNS_RESOLVER_ADDRESS` | NetBird 解析器监听地址（`ip:port`） | procd 下为 `127.0.0.1:5053`，其他为客户端默认 |
+| `NB_DNS_RESOLVER_ADDRESS` | NetBird 解析器监听地址（`ip:port`） | 客户端默认（或已保存的显式地址） |
 | `NB_DISABLE_DNS` | `1` = 完全不接管 DNS | `0` |
 | `NB_DISABLE_CLIENT_ROUTES` | `1` = 不接受其他节点发布的路由 | `0` |
 | `NB_DISABLE_SERVER_ROUTES` | `1` = 不作为路由节点 | `0` |
@@ -146,13 +145,13 @@ NB_SETUP_KEY_FILE=/root/nb.key \
 | `NB_EXTERNAL_IP_MAP` | 声明固定外网 IP（NAT 回流场景） | 空 |
 | `NB_NETWORK_MONITOR` | `1`/`0` = 网络变化时重建连接 | 客户端默认 |
 
-### OpenWrt 集成
+### OpenWrt 配置范围
 
-| 变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `NB_OPENWRT_DNS` | `1` = 添加 dnsmasq 对 NetBird 域名的转发条目 | `0` |
-| `NB_OPENWRT_FIREWALL` | `1` = 创建 `netbird` 接口、区域及 `lan ↔ netbird` 转发 | `0` |
-| `NB_DNS_DOMAIN` | 要转发的域名 | `netbird.cloud`，自建时为 `netbird.selfhosted` |
+安装和更新不会自动登录或执行 `netbird up`。请使用菜单 4（配置并连接）、菜单 5（使用已保存设置连接）或 `configure` / `up` 子命令手动连接。已有节点可能在服务重启后由 NetBird 自行恢复连接。
+
+脚本不会修改 UCI 网络、防火墙、转发或 dnsmasq 设置，也不会重载这些路由器服务。升级与卸载时，旧版本写入的规则同样保留，请自行管理。旧环境变量 `NB_OPENWRT_DNS`、`NB_OPENWRT_FIREWALL` 和 `NB_DNS_DOMAIN` 已移除，设置它们也不会启用集成。
+
+上方路由、DNS 与安全选项控制的是 NetBird 客户端自身在连接时的行为；它们不创建 OpenWrt 配置。
 
 ### 版本与下载
 
@@ -213,7 +212,7 @@ sh tests/test_upstream_compat.sh   # 需要网络；会真实下载一个 Releas
 
 CI 会在 `sh`、`dash`、`busybox sh` 下运行 ShellCheck 与单元测试；每周还有一个任务校验上游的架构矩阵、发布摘要与压缩包结构。
 
-更新时会恢复已保存的守护进程配置、socket 和日志设置，显式环境变量优先。连接功能开关以明确的 `true`/`false` 参数保存，重新配置时既能开启也能关闭。服务命令执行失败或守护进程未就绪时会返回失败。OpenWrt 防火墙设置会先重新加载网络配置，再应用区域规则。
+更新时会恢复已保存的守护进程配置、socket 和日志设置，显式环境变量优先。连接功能开关以明确的 `true`/`false` 参数保存，重新配置时既能开启也能关闭。服务命令执行失败或守护进程未就绪时会返回失败。安装流程与手动连接流程分开验证，确保不会调用路由器配置或服务。
 
 在 Git for Windows 下，测试会明确跳过 Unix 文件权限断言；Linux CI 仍会严格检查。若已下载官方客户端，可在运行 `test_regressions.sh` 时设置 `NB_TEST_REAL_BIN=/path/to/netbird`，额外验证密钥文件参数的兼容性；该验证不会连接网络或安装服务。
 
@@ -231,13 +230,13 @@ CI 会在 `sh`、`dash`、`busybox sh` 下运行 ShellCheck 与单元测试；�
 
 **Q：Setup Key 会被保存吗？** 不会。它被写入私有临时目录中的 0600 文件，以 `--setup-key-file` 传给客户端（因此不会出现在 `ps` 里），脚本退出时该文件会被清空并删除。`up.args` 只保存其他选项；节点身份由 NetBird 自己存放在其状态目录中。
 
-**Q：连接后路由器 DNS 不通了。** dnsmasq 已经占用 53 端口，所以 procd 下脚本会把 NetBird 的解析器固定到 `127.0.0.1:5053`，并询问是否添加对应的 dnsmasq 转发条目。如果当时跳过了，再运行一次脚本选择 **OpenWrt 集成 → DNS**；或者设置 `NB_DISABLE_DNS=1` 完全不接管 DNS。
+**Q：连接后路由器 DNS 不通了。** 请自行检查 NetBird 与路由器的 DNS 设置。脚本不再固定解析器端口或修改 dnsmasq；如需指定监听地址，可在手动配置时设置 `NB_DNS_RESOLVER_ADDRESS`。`NB_DISABLE_DNS=1` 可禁用 NetBird 客户端的 DNS 管理。
 
-**Q：能在 LuCI 里配置 `wt0` 吗？** 不能。该接口及其密钥由 NetBird 完全管理。脚本的防火墙集成把 `wt0` 以 `proto none` 加入网络配置，正是为了让防火墙能引用它，而不需要任何人去配置它。
+**Q：能在 LuCI 里配置 `wt0` 吗？** NetBird 创建并管理隧道接口及密钥。需要局域网访问时，请自行在 LuCI 或 OpenWrt 配置中设置接口关联、防火墙区域与转发规则；脚本不再创建这些设置。
 
 **Q：升级固件后 NetBird 还在吗？** sysupgrade 会清空 `/usr/bin`，二进制会丢失，需要重新运行脚本安装。`/etc/netbird` 下的配置在它位于 sysupgrade 备份列表中时可以保留；`/var/lib/netbird` 里的节点身份通常不会保留，所以要做好重新认证的准备。
 
-**Q：卸载会删掉配置和节点身份吗？** 不会自动删。卸载流程会**分别**询问备份、`/etc/netbird`、`/var/lib/netbird` 以及 OpenWrt 的网络/防火墙/DNS 配置，默认全部保留。在 NetBird 控制台中删除该 peer 是另外一步。
+**Q：卸载会删掉配置和节点身份吗？** 卸载会分别询问是否删除二进制备份、`/etc/netbird` 和 `/var/lib/netbird`，默认删除备份、保留配置与身份。路由器网络、防火墙和 DNS 配置始终交由用户管理，包括旧版本写入的条目。在 NetBird 控制台中删除该 peer 是另外一步。
 
 ---
 

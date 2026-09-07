@@ -30,25 +30,26 @@ cleanup_ci() {
     rm -rf "$T"
 }
 trap 'cleanup_ci' EXIT
-mkdir -p "$NB_BIN_DIR"
-cp "$NB_TEST_REAL_BIN" "$NB_BIN"
-chmod 755 "$NB_BIN"
-
-write_daemon_args
-svc_write
-svc_start
+# Exercise the complete install flow using the asset already verified by CI.
+# No setup key is supplied: installation must finish without attempting login.
+# shellcheck disable=SC2329  # called by the sourced install/update flows
+select_version() { :; }
+# shellcheck disable=SC2329
+do_download() { STAGED_BIN="$NB_TEST_REAL_BIN"; }
+NB_AUTH=key
+NB_SETUP_KEY=''; NB_SETUP_KEY_FILE=''
+do_install
+[ ! -e "$NB_UP_ARGS_FILE" ]
 _nb status
 [ -S "$T/first.sock" ]
-printf 'PASS: real systemd daemon starts and answers on the configured socket\n'
+printf 'PASS: install completes without login and the real daemon answers on the configured socket\n'
 
-# Exercise the actual replacement and service-file path with the already-verified
-# release, avoiding a redundant download. Authentication is deliberately omitted.
-STAGED_BIN="$NB_TEST_REAL_BIN"
+# Update must preserve saved connection options without attempting login.
+printf '%s\n' --interface-name nb-ci > "$NB_UP_ARGS_FILE"
+cp "$NB_UP_ARGS_FILE" "$T/up-before"
 NB_DAEMON_ADDR="unix://$T/second.sock"
-do_install_bin
-write_daemon_args
-svc_write
-svc_restart
+do_update
+cmp "$T/up-before" "$NB_UP_ARGS_FILE"
 _nb status
 [ -S "$T/second.sock" ]
 printf 'PASS: running binary replacement and socket change take effect\n'
