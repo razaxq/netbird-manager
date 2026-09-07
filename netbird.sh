@@ -1765,51 +1765,91 @@ do_reconfigure() {
 # ==============================================================================
 #  Menu
 # ==============================================================================
+_menu_rule() { printf '%s\n' '──────────────────────────────────────────'; }
+_menu_group() { printf '\n── %s ──\n\n' "$1"; }
+
 _menu_header() {
-    printf '\n'
-    printf "${C_BLD}  NetBird Manager v%s${C_RST}  ${C_DIM}%s / %s / %s${C_RST}\n" \
-           "$SCRIPT_VERSION" "$OS_TYPE" "$INIT_SYS" "$ARCH_NAME"
+    local version status color config
+    version="$(t "not installed" "未安装")"
+    status="$version"; color="$C_DIM"
     if [ -x "$NB_BIN" ]; then
-        if _daemon_running && is_connected; then
-            printf "  ${C_GRN}●${C_RST} %s  %s\n" "$(installed_version)" "$(t "connected" "已连接")"
-        elif _daemon_running; then
-            printf "  ${C_YLW}●${C_RST} %s  %s\n" "$(installed_version)" "$(t "running, not connected" "运行中，未连接")"
+        version=$(installed_version)
+        if _daemon_running; then
+            if is_connected; then
+                status="$(t "connected" "已连接")"; color="$C_GRN"
+            else
+                status="$(t "running, not connected" "运行中，未连接")"; color="$C_YLW"
+            fi
         else
-            printf "  ${C_RED}●${C_RST} %s  %s\n" "$(installed_version)" "$(t "stopped" "已停止")"
+            status="$(t "stopped" "已停止")"; color="$C_RED"
         fi
-    else
-        printf "  ${C_DIM}○ %s${C_RST}\n" "$(t "not installed" "未安装")"
     fi
+    if [ -n "$NB_MANAGEMENT_URL" ]; then
+        config="$(t "Self-hosted" "自建管理端") ($NB_MANAGEMENT_URL)"
+    elif [ -f "$NB_UP_ARGS_FILE" ]; then
+        config="$(t "NetBird Cloud" "NetBird 云服务")"
+    else
+        config="$(t "not configured" "未配置")"
+    fi
+
     printf '\n'
+    _menu_rule
+    printf "${C_BLD}NetBird Manager  v%s${C_RST}\n" "$SCRIPT_VERSION"
+    _menu_rule
+    printf '%s  %-12s %s  %s\n' "$(t "System" "系统")" "$OS_TYPE" "$(t "Arch" "架构")" "$ARCH_NAME"
+    printf '%s  %s\n' "$(t "Init   " "服务管理")" "$INIT_SYS"
+    printf '%s  %s\n' "$(t "Version" "客户端版本")" "$version"
+    if [ -x "$NB_BIN" ]; then
+        printf '%s  %b%s%b\n' "$(t "Status " "状态")" "$color" "$status" "$C_RST"
+    fi
+    printf '%s  %s\n' "$(t "Config " "配置")" "$config"
+    _menu_rule
+}
+
+_menu_options() {
+    _menu_group "$(t "Service" "服务")"
+    printf '%s\n\n' "$(t "1. View service status" "1. 查看服务状态")"
+    printf '%s\n\n' "$(t "2. Start / stop / restart" "2. 启动 / 停止 / 重启")"
+    printf '%s\n' "$(t "3. Disconnect (netbird down)" "3. 断开连接 (netbird down)")"
+    _menu_group "$(t "Configuration" "配置")"
+    printf '%s\n\n' "$(t "4. Configure and connect" "4. 配置并连接")"
+    printf '%s\n' "$(t "5. OpenWrt integration (DNS / firewall)" "5. OpenWrt 集成（DNS / 防火墙）")"
+    _menu_group "$(t "Maintenance" "维护")"
+    printf '%s\n\n' "$(t "6. Install / update (choose version)" "6. 安装 / 更新（选择版本）")"
+    printf '%s\n\n' "$(t "7. File locations & logs" "7. 文件位置与日志")"
+    printf '%s\n\n' "$(t "8. Uninstall NetBird" "8. 卸载 NetBird")"
+    printf '%s\n' "$(t "9. Exit" "9. 退出")"
+    printf '\n'
+    _menu_rule
+}
+
+_show_file_locations() {
+    section "$(t "File locations & logs" "文件位置与日志")"
+    printf '%s  %s\n' "$(t "Binary" "程序")" "$NB_BIN"
+    printf '%s  %s\n' "$(t "Configuration" "配置目录")" "$NB_ETC_DIR"
+    printf '%s  %s\n' "$(t "Service" "服务文件")" "$(svc_file_path)"
+    printf '%s  %s\n' "$(t "Manager log" "管理脚本日志")" "$LOG_FILE"
+    printf '\n'
+    _cmd_hint "$(_svc_log_cmd follow)" "$(t "follow" "实时跟踪")"
+    _cmd_hint "$(_svc_log_cmd recent)" "$(t "recent" "最近记录")"
+    _cmd_hint "tail -n 50 $LOG_FILE" "$(t "this script's log" "本脚本日志")"
 }
 
 menu() {
     while :; do
         _menu_header
-        printf '%s\n' "$(t "  1) Install / update NetBird" "  1) 安装 / 更新 NetBird")"
-        printf '%s\n' "$(t "  2) Configure and connect"     "  2) 配置并连接")"
-        printf '%s\n' "$(t "  3) Status"                    "  3) 查看状态")"
-        printf '%s\n' "$(t "  4) Start / stop / restart"    "  4) 启动 / 停止 / 重启")"
-        printf '%s\n' "$(t "  5) Disconnect (netbird down)" "  5) 断开连接 (netbird down)")"
-        printf '%s\n' "$(t "  6) OpenWrt integration (DNS / firewall)" "  6) OpenWrt 集成（DNS / 防火墙）")"
-        printf '%s\n' "$(t "  7) Log commands"              "  7) 日志命令")"
-        printf '%s\n' "$(t "  8) Uninstall"                 "  8) 卸载")"
-        printf '%s\n' "$(t "  0) Exit"                      "  0) 退出")"
-        printf '\n'
-        local ans; ans=$(_read_text "$(t "Choice" "请选择")" "")
+        _menu_options
+        local ans; ans=$(_read_text "$(t "Select" "请选择")" "")
         case "$ans" in
-            1) if [ -x "$NB_BIN" ]; then do_update; else do_install; fi ;;
-            2) do_reconfigure ;;
-            3) do_status ;;
-            4) svc_menu ;;
-            5) do_disconnect ;;
-            6) openwrt_menu ;;
-            7) section "$(t "Logs" "日志")"
-               _cmd_hint "$(_svc_log_cmd follow)" "$(t "follow" "实时跟踪")"
-               _cmd_hint "$(_svc_log_cmd recent)" "$(t "recent" "最近记录")"
-               _cmd_hint "tail -n 50 $LOG_FILE" "$(t "this script's log" "本脚本日志")" ;;
+            1) do_status ;;
+            2) svc_menu ;;
+            3) do_disconnect ;;
+            4) do_reconfigure ;;
+            5) openwrt_menu ;;
+            6) if [ -x "$NB_BIN" ]; then do_update; else do_install; fi ;;
+            7) _show_file_locations ;;
             8) do_uninstall ;;
-            0|q|Q) printf '\n'; exit 0 ;;
+            9|0|q|Q) printf '\n'; exit 0 ;;
             '') continue ;;
             *) msg_warn "$(t "Unknown choice" "无效选项")" ;;
         esac
